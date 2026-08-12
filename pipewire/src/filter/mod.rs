@@ -10,7 +10,14 @@
 use crate::{buffer::Buffer, error::Error, properties::Properties, properties::PropertiesBox};
 use bitflags::bitflags;
 use spa::utils::{dict::DictRef, result::SpaResult};
-use std::{cell::UnsafeCell, ffi, marker::PhantomData, os, pin::Pin, ptr};
+use std::{
+    cell::UnsafeCell,
+    ffi::{self, CStr, CString},
+    marker::PhantomData,
+    os,
+    pin::Pin,
+    ptr,
+};
 
 mod box_;
 pub use box_::*;
@@ -211,6 +218,35 @@ impl Filter {
         let mut error = ptr::null();
         let state = unsafe { pw_sys::pw_filter_get_state(self.as_raw_ptr(), &mut error) };
         FilterState::from_raw(state, error)
+    }
+
+    /// Moves the filter to PipeWire's error state.
+    ///
+    /// This method must run on the filter's main loop. It is not real-time
+    /// safe because PipeWire formats and allocates the retained error text.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `res` is not a negative errno-style result, or if `error`
+    /// contains a NUL byte.
+    pub fn set_error(&self, res: i32, error: &str) {
+        let error = CString::new(error).expect("filter error contains a NUL byte");
+        self.set_error_cstr(res, &error);
+    }
+
+    /// Moves the filter to PipeWire's error state using retained C text.
+    ///
+    /// This method must run on the filter's main loop and is not real-time
+    /// safe. See [`Filter::set_error`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `res` is not a negative errno-style result.
+    pub fn set_error_cstr(&self, res: i32, error: &CStr) {
+        assert!(res < 0, "a PipeWire filter error result must be negative");
+        unsafe {
+            pw_sys::pw_filter_set_error(self.as_raw_ptr(), res, c"%s".as_ptr(), error.as_ptr());
+        }
     }
 
     /// Returns global filter properties.
