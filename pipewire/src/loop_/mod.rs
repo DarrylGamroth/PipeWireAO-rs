@@ -285,14 +285,28 @@ impl Loop {
     #[must_use]
     pub fn add_event<F>(&self, callback: F) -> EventSource<'_>
     where
-        F: Fn() + 'static,
+        F: FnMut() + 'static,
+        Self: Sized,
+    {
+        self.add_event_local(callback)
+    }
+
+    /// Registers an event callback that may borrow objects which outlive the
+    /// returned source.
+    ///
+    /// Use [`EventSource::signal_handle`] to signal the event from another,
+    /// including a real-time, thread.
+    #[must_use]
+    pub fn add_event_local<'l, F>(&'l self, callback: F) -> EventSource<'l>
+    where
+        F: FnMut() + 'l,
         Self: Sized,
     {
         unsafe extern "C" fn call_closure<F>(data: *mut c_void, _count: u64)
         where
-            F: Fn(),
+            F: FnMut(),
         {
-            let callback = (data as *mut F).as_ref().unwrap();
+            let callback = (data as *mut F).as_mut().unwrap();
             callback();
         }
 
@@ -514,7 +528,7 @@ pub struct EventSource<'l> {
     ptr: ptr::NonNull<spa_sys::spa_source>,
     loop_: &'l Loop,
     // Store data wrapper to prevent leak
-    _data: Box<dyn Fn() + 'static>,
+    _data: Box<dyn FnMut() + 'l>,
 }
 
 impl<'l> IsSource for EventSource<'l> {
@@ -527,20 +541,60 @@ impl<'l> EventSource<'l> {
     /// Signal the loop associated with this source that the event has occurred,
     /// to make the loop call the callback at the next possible occasion.
     pub fn signal(&self) -> SpaResult {
-        let res = unsafe {
-            let mut iface = self.loop_.as_raw().utils.as_ref().unwrap().iface;
+        signal_event(self.loop_, self.as_ptr())
+    }
 
-            spa_interface_call_method!(
-                &mut iface as *mut spa_sys::spa_interface,
-                spa_sys::spa_loop_utils_methods,
-                signal_event,
-                self.as_ptr()
-            )
-        };
-
-        SpaResult::from_c(res)
+    /// Returns a copyable handle that can signal this event from another
+    /// thread without taking ownership of the event source.
+    pub fn signal_handle(&self) -> EventSignal<'_> {
+        EventSignal {
+            source: self.ptr,
+            loop_: ptr::NonNull::from(self.loop_),
+            lifetime: std::marker::PhantomData,
+        }
     }
 }
+
+fn signal_event(loop_: &Loop, source: *mut spa_sys::spa_source) -> SpaResult {
+    let res = unsafe {
+        let mut iface = loop_.as_raw().utils.as_ref().unwrap().iface;
+
+        spa_interface_call_method!(
+            &mut iface as *mut spa_sys::spa_interface,
+            spa_sys::spa_loop_utils_methods,
+            signal_event,
+            source
+        )
+    };
+
+    SpaResult::from_c(res)
+}
+
+/// A borrowed handle for signaling one loop event from another thread.
+///
+/// Signaling writes to the loop's nonblocking event descriptor and is the
+/// mechanism used by PipeWire examples to wake a main loop from an RT process
+/// callback. The originating [`EventSource`] must remain alive.
+#[derive(Clone, Copy)]
+pub struct EventSignal<'s> {
+    source: ptr::NonNull<spa_sys::spa_source>,
+    loop_: ptr::NonNull<Loop>,
+    lifetime: std::marker::PhantomData<&'s ()>,
+}
+
+impl EventSignal<'_> {
+    /// Signals the associated event source.
+    pub fn signal(&self) -> SpaResult {
+        unsafe { signal_event(self.loop_.as_ref(), self.source.as_ptr()) }
+    }
+}
+
+// SAFETY: `EventSignal` only invokes the loop's thread-safe, nonblocking
+// signal-event operation. Its lifetime prevents use after the source is
+// destroyed, and it does not expose either underlying pointer.
+unsafe impl Send for EventSignal<'_> {}
+// SAFETY: Concurrent signals are combined by the loop event descriptor.
+unsafe impl Sync for EventSignal<'_> {}
 
 impl<'l> Drop for EventSource<'l> {
     fn drop(&mut self) {

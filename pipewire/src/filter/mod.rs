@@ -319,7 +319,7 @@ impl<D> FilterPort<'_, D> {
 
     /// Takes an available buffer from this port.
     pub fn dequeue_buffer(&self) -> Option<Buffer<'_>> {
-        unsafe { Buffer::from_filter_raw(self.dequeue_raw_buffer(), self.port_data, self) }
+        unsafe { Buffer::from_filter_raw(self.dequeue_raw_buffer(), self.port_data) }
     }
 
     /// Takes an available raw buffer from this port.
@@ -387,10 +387,10 @@ pub struct FilterPortRef<'f> {
     lifetime: PhantomData<&'f Filter>,
 }
 
-impl FilterPortRef<'_> {
+impl<'f> FilterPortRef<'f> {
     /// Takes an available buffer from this port.
-    pub fn dequeue_buffer(&self) -> Option<Buffer<'_>> {
-        unsafe { Buffer::from_filter_raw(self.dequeue_raw_buffer(), self.port_data, self) }
+    pub fn dequeue_buffer(&self) -> Option<Buffer<'f>> {
+        unsafe { Buffer::from_filter_raw(self.dequeue_raw_buffer(), self.port_data) }
     }
 
     /// Takes an available raw buffer from this port.
@@ -434,30 +434,32 @@ impl FilterPortRef<'_> {
 // alive by its lifetime.
 unsafe impl Sync for FilterPortRef<'_> {}
 
-type StateChangedCb<D> = dyn FnMut(&Filter, &D, FilterState, FilterState) + Send;
-type IoChangedCb<D> =
-    dyn FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, *mut ffi::c_void, u32) + Send;
-type ParamChangedCb<D> =
-    dyn FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, Option<&spa::pod::Pod>) + Send;
-type BufferCb<D> = dyn FnMut(&Filter, &D, FilterPortRef<'_>, *mut pw_sys::pw_buffer) + Send;
-type ProcessCb<D> = dyn FnMut(&Filter, &D, Option<&spa_sys::spa_io_position>) + Send;
+type StateChangedCb<'a, D> = dyn FnMut(&Filter, &D, FilterState, FilterState) + Send + 'a;
+type IoChangedCb<'a, D> =
+    dyn FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, *mut ffi::c_void, u32) + Send + 'a;
+type ParamChangedCb<'a, D> =
+    dyn FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, Option<&spa::pod::Pod>) + Send + 'a;
+type BufferCb<'a, D> =
+    dyn FnMut(&Filter, &D, FilterPortRef<'_>, *mut pw_sys::pw_buffer) + Send + 'a;
+type ProcessCb<'a, D> = dyn FnMut(&Filter, &D, Option<&spa_sys::spa_io_position>) + Send + 'a;
 
 #[allow(clippy::type_complexity)]
-struct ListenerLocalCallbacks<D> {
-    state_changed: UnsafeCell<Option<Box<StateChangedCb<D>>>>,
-    io_changed: UnsafeCell<Option<Box<IoChangedCb<D>>>>,
-    param_changed: UnsafeCell<Option<Box<ParamChangedCb<D>>>>,
-    add_buffer: UnsafeCell<Option<Box<BufferCb<D>>>>,
-    remove_buffer: UnsafeCell<Option<Box<BufferCb<D>>>>,
-    process: UnsafeCell<Option<Box<ProcessCb<D>>>>,
-    drained: UnsafeCell<Option<Box<dyn FnMut(&Filter, &D) + Send>>>,
+struct ListenerLocalCallbacks<'a, D> {
+    state_changed: UnsafeCell<Option<Box<StateChangedCb<'a, D>>>>,
+    io_changed: UnsafeCell<Option<Box<IoChangedCb<'a, D>>>>,
+    param_changed: UnsafeCell<Option<Box<ParamChangedCb<'a, D>>>>,
+    add_buffer: UnsafeCell<Option<Box<BufferCb<'a, D>>>>,
+    remove_buffer: UnsafeCell<Option<Box<BufferCb<'a, D>>>>,
+    process: UnsafeCell<Option<Box<ProcessCb<'a, D>>>>,
+    drained: UnsafeCell<Option<Box<dyn FnMut(&Filter, &D) + Send + 'a>>>,
     #[cfg(feature = "v0_3_39")]
-    command: UnsafeCell<Option<Box<dyn FnMut(&Filter, &D, *const spa_sys::spa_command) + Send>>>,
+    command:
+        UnsafeCell<Option<Box<dyn FnMut(&Filter, &D, *const spa_sys::spa_command) + Send + 'a>>>,
     user_data: D,
     filter: Option<ptr::NonNull<pw_sys::pw_filter>>,
 }
 
-impl<D> ListenerLocalCallbacks<D> {
+impl<'a, D> ListenerLocalCallbacks<'a, D> {
     fn with_user_data(user_data: D) -> Self {
         Self {
             state_changed: UnsafeCell::new(None),
@@ -504,7 +506,7 @@ impl<D> ListenerLocalCallbacks<D> {
             new: pw_sys::pw_filter_state,
             error: *const os::raw::c_char,
         ) {
-            let callbacks = data.cast::<ListenerLocalCallbacks<D>>();
+            let callbacks = data.cast::<ListenerLocalCallbacks<'_, D>>();
             if !callbacks.is_null() {
                 let filter = filter((*callbacks).filter);
                 let user_data = &*ptr::addr_of!((*callbacks).user_data);
@@ -526,7 +528,7 @@ impl<D> ListenerLocalCallbacks<D> {
             area: *mut ffi::c_void,
             size: u32,
         ) {
-            let callbacks = data.cast::<ListenerLocalCallbacks<D>>();
+            let callbacks = data.cast::<ListenerLocalCallbacks<'_, D>>();
             if !callbacks.is_null() {
                 let filter = filter((*callbacks).filter);
                 let port = port(filter, port_data);
@@ -543,7 +545,7 @@ impl<D> ListenerLocalCallbacks<D> {
             id: u32,
             param: *const spa_sys::spa_pod,
         ) {
-            let callbacks = data.cast::<ListenerLocalCallbacks<D>>();
+            let callbacks = data.cast::<ListenerLocalCallbacks<'_, D>>();
             if !callbacks.is_null() {
                 let filter = filter((*callbacks).filter);
                 let port = port(filter, port_data);
@@ -560,7 +562,7 @@ impl<D> ListenerLocalCallbacks<D> {
             port_data: *mut ffi::c_void,
             buffer: *mut pw_sys::pw_buffer,
         ) {
-            let callbacks = data.cast::<ListenerLocalCallbacks<D>>();
+            let callbacks = data.cast::<ListenerLocalCallbacks<'_, D>>();
             if !callbacks.is_null() {
                 let filter = filter((*callbacks).filter);
                 let Some(port) = port(filter, port_data) else {
@@ -578,7 +580,7 @@ impl<D> ListenerLocalCallbacks<D> {
             port_data: *mut ffi::c_void,
             buffer: *mut pw_sys::pw_buffer,
         ) {
-            let callbacks = data.cast::<ListenerLocalCallbacks<D>>();
+            let callbacks = data.cast::<ListenerLocalCallbacks<'_, D>>();
             if !callbacks.is_null() {
                 let filter = filter((*callbacks).filter);
                 let Some(port) = port(filter, port_data) else {
@@ -595,7 +597,7 @@ impl<D> ListenerLocalCallbacks<D> {
             data: *mut ffi::c_void,
             position: *mut spa_sys::spa_io_position,
         ) {
-            let callbacks = data.cast::<ListenerLocalCallbacks<D>>();
+            let callbacks = data.cast::<ListenerLocalCallbacks<'_, D>>();
             if !callbacks.is_null() {
                 let filter = filter((*callbacks).filter);
                 let user_data = &*ptr::addr_of!((*callbacks).user_data);
@@ -606,7 +608,7 @@ impl<D> ListenerLocalCallbacks<D> {
         }
 
         unsafe extern "C" fn on_drained<D: Sync>(data: *mut ffi::c_void) {
-            let callbacks = data.cast::<ListenerLocalCallbacks<D>>();
+            let callbacks = data.cast::<ListenerLocalCallbacks<'_, D>>();
             if !callbacks.is_null() {
                 let filter = filter((*callbacks).filter);
                 let user_data = &*ptr::addr_of!((*callbacks).user_data);
@@ -621,7 +623,7 @@ impl<D> ListenerLocalCallbacks<D> {
             data: *mut ffi::c_void,
             command: *const spa_sys::spa_command,
         ) {
-            let callbacks = data.cast::<ListenerLocalCallbacks<D>>();
+            let callbacks = data.cast::<ListenerLocalCallbacks<'_, D>>();
             if !callbacks.is_null() {
                 let filter = filter((*callbacks).filter);
                 let user_data = &*ptr::addr_of!((*callbacks).user_data);
@@ -671,14 +673,14 @@ impl<D> ListenerLocalCallbacks<D> {
 /// Builder for local filter event callbacks.
 pub struct ListenerLocalBuilder<'a, D> {
     filter: &'a Filter,
-    callbacks: ListenerLocalCallbacks<D>,
+    callbacks: ListenerLocalCallbacks<'a, D>,
 }
 
-impl<D> ListenerLocalBuilder<'_, D> {
+impl<'a, D> ListenerLocalBuilder<'a, D> {
     #[must_use = "Call `.register()` to start receiving events"]
     pub fn state_changed<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&Filter, &D, FilterState, FilterState) + Send + 'static,
+        F: FnMut(&Filter, &D, FilterState, FilterState) + Send + 'a,
     {
         *self.callbacks.state_changed.get_mut() = Some(Box::new(callback));
         self
@@ -687,9 +689,7 @@ impl<D> ListenerLocalBuilder<'_, D> {
     #[must_use = "Call `.register()` to start receiving events"]
     pub fn io_changed<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, *mut ffi::c_void, u32)
-            + Send
-            + 'static,
+        F: FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, *mut ffi::c_void, u32) + Send + 'a,
     {
         *self.callbacks.io_changed.get_mut() = Some(Box::new(callback));
         self
@@ -698,9 +698,7 @@ impl<D> ListenerLocalBuilder<'_, D> {
     #[must_use = "Call `.register()` to start receiving events"]
     pub fn param_changed<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, Option<&spa::pod::Pod>)
-            + Send
-            + 'static,
+        F: FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, Option<&spa::pod::Pod>) + Send + 'a,
     {
         *self.callbacks.param_changed.get_mut() = Some(Box::new(callback));
         self
@@ -709,7 +707,7 @@ impl<D> ListenerLocalBuilder<'_, D> {
     #[must_use = "Call `.register()` to start receiving events"]
     pub fn add_buffer<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&Filter, &D, FilterPortRef<'_>, *mut pw_sys::pw_buffer) + Send + 'static,
+        F: FnMut(&Filter, &D, FilterPortRef<'_>, *mut pw_sys::pw_buffer) + Send + 'a,
     {
         *self.callbacks.add_buffer.get_mut() = Some(Box::new(callback));
         self
@@ -718,7 +716,7 @@ impl<D> ListenerLocalBuilder<'_, D> {
     #[must_use = "Call `.register()` to start receiving events"]
     pub fn remove_buffer<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&Filter, &D, FilterPortRef<'_>, *mut pw_sys::pw_buffer) + Send + 'static,
+        F: FnMut(&Filter, &D, FilterPortRef<'_>, *mut pw_sys::pw_buffer) + Send + 'a,
     {
         *self.callbacks.remove_buffer.get_mut() = Some(Box::new(callback));
         self
@@ -727,7 +725,7 @@ impl<D> ListenerLocalBuilder<'_, D> {
     #[must_use = "Call `.register()` to start receiving events"]
     pub fn process<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&Filter, &D, Option<&spa_sys::spa_io_position>) + Send + 'static,
+        F: FnMut(&Filter, &D, Option<&spa_sys::spa_io_position>) + Send + 'a,
     {
         *self.callbacks.process.get_mut() = Some(Box::new(callback));
         self
@@ -736,7 +734,7 @@ impl<D> ListenerLocalBuilder<'_, D> {
     #[must_use = "Call `.register()` to start receiving events"]
     pub fn drained<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&Filter, &D) + Send + 'static,
+        F: FnMut(&Filter, &D) + Send + 'a,
     {
         *self.callbacks.drained.get_mut() = Some(Box::new(callback));
         self
@@ -746,14 +744,14 @@ impl<D> ListenerLocalBuilder<'_, D> {
     #[must_use = "Call `.register()` to start receiving events"]
     pub fn command<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&Filter, &D, *const spa_sys::spa_command) + Send + 'static,
+        F: FnMut(&Filter, &D, *const spa_sys::spa_command) + Send + 'a,
     {
         *self.callbacks.command.get_mut() = Some(Box::new(callback));
         self
     }
 
     /// Registers the selected callbacks.
-    pub fn register(self) -> Result<FilterListener<D>, Error>
+    pub fn register(self) -> Result<FilterListener<'a, D>, Error>
     where
         D: Sync,
     {
@@ -780,18 +778,18 @@ impl<D> ListenerLocalBuilder<'_, D> {
 
 /// Owned filter event listener that unregisters itself when dropped.
 #[must_use = "Keep the listener alive in order to receive events"]
-pub struct FilterListener<D> {
+pub struct FilterListener<'a, D> {
     listener: Box<spa_sys::spa_hook>,
     _events: Pin<Box<pw_sys::pw_filter_events>>,
-    _data: Box<ListenerLocalCallbacks<D>>,
+    _data: Box<ListenerLocalCallbacks<'a, D>>,
 }
 
-impl<D> FilterListener<D> {
+impl<D> FilterListener<'_, D> {
     /// Stops receiving events by consuming this listener.
     pub fn unregister(self) {}
 }
 
-impl<D> Drop for FilterListener<D> {
+impl<D> Drop for FilterListener<'_, D> {
     fn drop(&mut self) {
         spa::utils::hook::remove(*self.listener);
     }
