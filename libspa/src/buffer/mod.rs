@@ -129,6 +129,8 @@ bitflags::bitflags! {
     pub struct ChunkFlags: i32 {
         /// Chunk data is corrupted in some way
         const CORRUPTED = 1<<0;
+        /// Chunk data is empty and represents media-neutral data.
+        const EMPTY = 1<<1;
     }
 }
 
@@ -167,6 +169,11 @@ impl Chunk {
     pub fn flags(&self) -> ChunkFlags {
         ChunkFlags::from_bits_retain(self.0.flags)
     }
+
+    /// Sets the chunk flags.
+    pub fn set_flags(&mut self, flags: ChunkFlags) {
+        self.0.flags = flags.bits();
+    }
 }
 
 impl Debug for Chunk {
@@ -177,5 +184,29 @@ impl Debug for Chunk {
             .field("stride", &self.stride())
             .field("flags", &self.flags())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(raw: &mut spa_sys::spa_chunk) -> &mut Chunk {
+        // SAFETY: `Chunk` is a transparent wrapper around `spa_chunk`.
+        unsafe { &mut *(raw as *mut _ as *mut Chunk) }
+    }
+
+    #[test]
+    fn chunk_flags_can_be_replaced() {
+        let mut raw = spa_sys::spa_chunk {
+            offset: 0,
+            size: 0,
+            stride: 0,
+            flags: ChunkFlags::CORRUPTED.bits(),
+        };
+
+        chunk(&mut raw).set_flags(ChunkFlags::EMPTY);
+
+        assert_eq!(chunk(&mut raw).flags(), ChunkFlags::EMPTY);
     }
 }
