@@ -45,9 +45,19 @@ impl MetaHeader {
         MetaHeaderFlags::from_bits_retain(self.0.flags)
     }
 
+    /// Sets the header flags.
+    pub fn set_flags(&mut self, flags: MetaHeaderFlags) {
+        self.0.flags = flags.bits();
+    }
+
     /// Offset in current cycle
     pub fn offset(&self) -> u32 {
         self.0.offset
+    }
+
+    /// Sets the offset in the current cycle.
+    pub fn set_offset(&mut self, offset: u32) {
+        self.0.offset = offset;
     }
 
     /// Presentation timestamp in nanoseconds
@@ -55,14 +65,29 @@ impl MetaHeader {
         self.0.pts
     }
 
+    /// Sets the presentation timestamp in nanoseconds.
+    pub fn set_pts(&mut self, pts: i64) {
+        self.0.pts = pts;
+    }
+
     /// Decoding timestamp as a difference with pts
     pub fn dts_offset(&self) -> i64 {
         self.0.dts_offset
     }
 
+    /// Sets the decoding timestamp difference from the presentation timestamp.
+    pub fn set_dts_offset(&mut self, dts_offset: i64) {
+        self.0.dts_offset = dts_offset;
+    }
+
     /// Sequence number, increments with a media specific frequency
     pub fn seq(&self) -> u64 {
         self.0.seq
+    }
+
+    /// Sets the media-specific sequence number.
+    pub fn set_seq(&mut self, seq: u64) {
+        self.0.seq = seq;
     }
 
     /// Copies all header fields from another buffer header.
@@ -85,6 +110,37 @@ impl Debug for MetaHeader {
 
 impl Metadata for MetaHeader {
     const META_TYPE: u32 = spa_sys::SPA_META_Header;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_fields_can_be_updated_without_raw_pointer_access() {
+        let mut header = MetaHeader(spa_sys::spa_meta_header {
+            flags: 0,
+            offset: 0,
+            pts: 0,
+            dts_offset: 0,
+            seq: 0,
+        });
+
+        header.set_flags(MetaHeaderFlags::DISCONT | MetaHeaderFlags::MARKER);
+        header.set_offset(3);
+        header.set_pts(5);
+        header.set_dts_offset(-2);
+        header.set_seq(7);
+
+        assert_eq!(
+            header.flags(),
+            MetaHeaderFlags::DISCONT | MetaHeaderFlags::MARKER
+        );
+        assert_eq!(header.offset(), 3);
+        assert_eq!(header.pts(), 5);
+        assert_eq!(header.dts_offset(), -2);
+        assert_eq!(header.seq(), 7);
+    }
 }
 
 #[derive(Clone)]
