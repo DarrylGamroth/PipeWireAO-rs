@@ -147,6 +147,7 @@ pub mod context;
 pub mod core;
 pub mod device;
 pub mod factory;
+pub mod filter;
 pub mod keys;
 pub mod link;
 pub mod loop_;

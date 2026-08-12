@@ -64,6 +64,11 @@ impl MetaHeader {
     pub fn seq(&self) -> u64 {
         self.0.seq
     }
+
+    /// Copies all header fields from another buffer header.
+    pub fn copy_from(&mut self, other: &Self) {
+        self.0 = other.0;
+    }
 }
 
 impl Debug for MetaHeader {
