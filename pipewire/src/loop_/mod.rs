@@ -39,6 +39,28 @@ impl Loop {
         std::ptr::addr_of!(self.0).cast_mut()
     }
 
+    /// Invokes one operation synchronously in this loop's dispatch context.
+    ///
+    /// # Safety
+    ///
+    /// `user_data` must remain valid until the blocking invocation returns,
+    /// and `callback` must interpret it as the same concrete type.
+    unsafe fn invoke_blocking(
+        &self,
+        callback: spa_sys::spa_invoke_func_t,
+        user_data: *mut c_void,
+    ) -> SpaResult {
+        SpaResult::from_c(spa_sys::spa_loop_invoke(
+            self.as_raw().loop_,
+            callback,
+            spa_sys::SPA_ID_INVALID,
+            ptr::null(),
+            0,
+            true,
+            user_data,
+        ))
+    }
+
     /// Get the file descriptor backing this loop.
     pub fn fd(&self) -> BorrowedFd<'_> {
         unsafe {
@@ -373,8 +395,96 @@ impl Loop {
         TimerSource {
             ptr,
             loop_: self,
-            _data: data,
+            data: Some(data),
+            thread_invoked: false,
         }
+    }
+
+    /// Registers a timer on a loop that is already dispatching on another
+    /// thread.
+    ///
+    /// Registration, updates, and destruction are synchronously invoked in
+    /// the loop's own context. The callback must be transferable to that
+    /// thread. This is suitable for adding a timer to a connected filter's
+    /// assigned data loop.
+    pub fn add_timer_from_thread<'l, F>(
+        &'l self,
+        callback: F,
+    ) -> Result<TimerSource<'l>, spa::utils::result::Error>
+    where
+        F: Fn(u64) + Send + 'l,
+        Self: Sized,
+    {
+        unsafe extern "C" fn call_closure<F>(data: *mut c_void, expirations: u64)
+        where
+            F: Fn(u64),
+        {
+            let callback = (data as *mut F).as_ref().unwrap();
+            callback(expirations);
+        }
+
+        struct AddTimer<F> {
+            loop_: *const Loop,
+            callback: *mut F,
+            source: *mut spa_sys::spa_source,
+        }
+
+        unsafe extern "C" fn add_timer<F>(
+            _loop: *mut spa_sys::spa_loop,
+            _async: bool,
+            _seq: u32,
+            _data: *const c_void,
+            _size: usize,
+            user_data: *mut c_void,
+        ) -> c_int
+        where
+            F: Fn(u64),
+        {
+            let request = &mut *user_data.cast::<AddTimer<F>>();
+            let loop_ = &*request.loop_;
+            let mut iface = loop_.as_raw().utils.as_ref().unwrap().iface;
+            request.source = spa_interface_call_method!(
+                &mut iface as *mut spa_sys::spa_interface,
+                spa_sys::spa_loop_utils_methods,
+                add_timer,
+                Some(call_closure::<F>),
+                request.callback.cast()
+            );
+            if request.source.is_null() {
+                -libc::ENOMEM
+            } else {
+                0
+            }
+        }
+
+        let callback = Box::into_raw(Box::new(callback));
+        let mut request = AddTimer {
+            loop_: self,
+            callback,
+            source: ptr::null_mut(),
+        };
+        let result = unsafe {
+            self.invoke_blocking(
+                Some(add_timer::<F>),
+                ptr::addr_of_mut!(request).cast::<c_void>(),
+            )
+        }
+        .into_result();
+        if let Err(error) = result {
+            unsafe {
+                drop(Box::from_raw(callback));
+            }
+            return Err(error);
+        }
+
+        let ptr = ptr::NonNull::new(request.source).expect("successful timer registration is null");
+        let data = unsafe { Box::from_raw(callback) };
+        Ok(TimerSource {
+            ptr,
+            loop_: self,
+            data: Some(data),
+            thread_invoked: true,
+        })
     }
 
     /// Destroy a source that belongs to this loop.
@@ -612,7 +722,8 @@ pub struct TimerSource<'l> {
     ptr: ptr::NonNull<spa_sys::spa_source>,
     loop_: &'l Loop,
     // Store data wrapper to prevent leak
-    _data: Box<dyn Fn(u64) + 'static>,
+    data: Option<Box<dyn Fn(u64) + 'l>>,
+    thread_invoked: bool,
 }
 
 impl<'l> TimerSource<'l> {
@@ -648,18 +759,64 @@ impl<'l> TimerSource<'l> {
         let value = duration_to_timespec(value.unwrap_or_default());
         let interval = duration_to_timespec(interval.unwrap_or_default());
 
-        let res = unsafe {
-            let mut iface = self.loop_.as_raw().utils.as_ref().unwrap().iface;
+        unsafe fn update_timer(
+            loop_: &Loop,
+            source: *mut spa_sys::spa_source,
+            value: &spa_sys::timespec,
+            interval: &spa_sys::timespec,
+        ) -> c_int {
+            let mut iface = loop_.as_raw().utils.as_ref().unwrap().iface;
 
             spa_interface_call_method!(
                 &mut iface as *mut spa_sys::spa_interface,
                 spa_sys::spa_loop_utils_methods,
                 update_timer,
-                self.as_ptr(),
-                &value as *const _ as *mut _,
-                &interval as *const _ as *mut _,
+                source,
+                value as *const _ as *mut _,
+                interval as *const _ as *mut _,
                 false
             )
+        }
+
+        struct UpdateTimer {
+            loop_: *const Loop,
+            source: *mut spa_sys::spa_source,
+            value: spa_sys::timespec,
+            interval: spa_sys::timespec,
+        }
+
+        unsafe extern "C" fn update_timer_in_loop(
+            _loop: *mut spa_sys::spa_loop,
+            _async: bool,
+            _seq: u32,
+            _data: *const c_void,
+            _size: usize,
+            user_data: *mut c_void,
+        ) -> c_int {
+            let request = &*user_data.cast::<UpdateTimer>();
+            update_timer(
+                &*request.loop_,
+                request.source,
+                &request.value,
+                &request.interval,
+            )
+        }
+
+        let res = if self.thread_invoked {
+            let mut request = UpdateTimer {
+                loop_: self.loop_,
+                source: self.as_ptr(),
+                value,
+                interval,
+            };
+            return unsafe {
+                self.loop_.invoke_blocking(
+                    Some(update_timer_in_loop),
+                    ptr::addr_of_mut!(request).cast::<c_void>(),
+                )
+            };
+        } else {
+            unsafe { update_timer(self.loop_, self.as_ptr(), &value, &interval) }
         };
 
         SpaResult::from_c(res)
@@ -674,6 +831,51 @@ impl<'l> IsSource for TimerSource<'l> {
 
 impl<'l> Drop for TimerSource<'l> {
     fn drop(&mut self) {
-        unsafe { self.loop_.destroy_source(self) }
+        if !self.thread_invoked {
+            unsafe { self.loop_.destroy_source(self) }
+            return;
+        }
+
+        struct DestroyTimer {
+            loop_: *const Loop,
+            source: *mut spa_sys::spa_source,
+        }
+
+        unsafe extern "C" fn destroy_timer_in_loop(
+            _loop: *mut spa_sys::spa_loop,
+            _async: bool,
+            _seq: u32,
+            _data: *const c_void,
+            _size: usize,
+            user_data: *mut c_void,
+        ) -> c_int {
+            let request = &*user_data.cast::<DestroyTimer>();
+            let loop_ = &*request.loop_;
+            let mut iface = loop_.as_raw().utils.as_ref().unwrap().iface;
+            spa_interface_call_method!(
+                &mut iface as *mut spa_sys::spa_interface,
+                spa_sys::spa_loop_utils_methods,
+                destroy_source,
+                request.source
+            );
+            0
+        }
+
+        let mut request = DestroyTimer {
+            loop_: self.loop_,
+            source: self.as_ptr(),
+        };
+        let result = unsafe {
+            self.loop_.invoke_blocking(
+                Some(destroy_timer_in_loop),
+                ptr::addr_of_mut!(request).cast::<c_void>(),
+            )
+        }
+        .into_result();
+        if result.is_err() {
+            // The source can still call this allocation, so leak the callback
+            // rather than free storage referenced by the running loop.
+            std::mem::forget(self.data.take());
+        }
     }
 }

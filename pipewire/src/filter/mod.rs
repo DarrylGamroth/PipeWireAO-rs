@@ -283,12 +283,56 @@ impl Filter {
         Ok(())
     }
 
+    /// Returns a lifetime-bound handle that can trigger this filter from an
+    /// RT callback on another thread.
+    #[cfg(feature = "v0_3_77")]
+    pub fn trigger_handle(&self) -> FilterTrigger<'_> {
+        FilterTrigger {
+            filter: ptr::NonNull::new(self.as_raw_ptr()).expect("filter cannot be null"),
+            lifetime: PhantomData,
+        }
+    }
+
     /// Returns PipeWire's monotonic time in nanoseconds.
     #[cfg(feature = "v1_2_0")]
     pub fn nsec(&self) -> u64 {
         unsafe { pw_sys::pw_filter_get_nsec(self.as_raw_ptr()) }
     }
+
+    /// Returns the data loop assigned to this connected filter.
+    ///
+    /// The loop is assigned by PipeWire during [`Filter::connect`]. Use
+    /// [`crate::loop_::Loop::add_timer_from_thread`] when the assigned loop is
+    /// already dispatching on its data thread.
+    #[cfg(feature = "v1_2_0")]
+    pub fn data_loop(&self) -> Option<&crate::loop_::Loop> {
+        unsafe {
+            ptr::NonNull::new(pw_sys::pw_filter_get_data_loop(self.as_raw_ptr()))
+                .map(|loop_| loop_.cast::<crate::loop_::Loop>().as_ref())
+        }
+    }
 }
+
+/// A lifetime-bound handle for PipeWire's RT-safe filter trigger operation.
+#[cfg(feature = "v0_3_77")]
+pub struct FilterTrigger<'f> {
+    filter: ptr::NonNull<pw_sys::pw_filter>,
+    lifetime: PhantomData<&'f Filter>,
+}
+
+impl FilterTrigger<'_> {
+    /// Requests one graph iteration for the associated trigger or driver
+    /// filter.
+    pub fn trigger_process(&self) -> Result<(), Error> {
+        let result = unsafe { pw_sys::pw_filter_trigger_process(self.filter.as_ptr()) };
+        SpaResult::from_c(result).into_result()?;
+        Ok(())
+    }
+}
+
+// SAFETY: `FilterTrigger` exposes only `pw_filter_trigger_process`, documented
+// by PipeWire as RT-safe. The lifetime prevents use after filter destruction.
+unsafe impl Send for FilterTrigger<'_> {}
 
 /// An owned registration for one filter port.
 pub struct FilterPort<'f, D = ()> {

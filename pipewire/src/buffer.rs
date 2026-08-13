@@ -3,8 +3,10 @@ use super::stream::Stream;
 use spa::buffer::meta::Metadata;
 use spa::buffer::Data;
 use std::convert::TryFrom;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 pub struct Buffer<'s> {
     buf: NonNull<pw_sys::pw_buffer>,
@@ -43,12 +45,14 @@ impl<'s> Buffer<'s> {
 
     /// Retains a filter-port buffer beyond the callback that dequeued it.
     ///
-    /// The returned guard may be moved to one other thread. It keeps exclusive
-    /// ownership of the mapped SPA buffer and returns that buffer to its filter
-    /// port when dropped. Stream buffers cannot be retained with this method.
+    /// The returned guard keeps exclusive ownership of the mapped SPA buffer
+    /// and returns that buffer to its filter port when dropped. It deliberately
+    /// does not implement `Send`: PipeWire documents filter dequeue and queue
+    /// as RT-safe, but does not give this general wrapper a cross-thread queue
+    /// ownership contract. Stream buffers cannot be retained with this method.
     pub fn retain_filter(self) -> Result<RetainedFilterBuffer<'s>, Self> {
         if matches!(&self.owner, BufferOwner::FilterPort(_, _)) {
-            Ok(RetainedFilterBuffer(self))
+            Ok(RetainedFilterBuffer(self, PhantomData))
         } else {
             Err(self)
         }
@@ -134,13 +138,19 @@ impl<'s> Buffer<'s> {
     }
 }
 
-/// An exclusively owned filter-port buffer that may cross a thread boundary.
+/// An exclusively owned filter-port buffer retained beyond one callback.
 ///
 /// PipeWire documents filter dequeue and queue operations as RT-safe. The
 /// buffer remains owned by the caller between those operations, and the
 /// filter port must outlive this guard. Dropping the guard queues the buffer
-/// back to the same port.
-pub struct RetainedFilterBuffer<'f>(Buffer<'f>);
+/// back to the same port. Cross-thread transfer requires a narrower owner that
+/// can prove the producer/consumer topology for that particular port.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<pipewire::buffer::RetainedFilterBuffer<'static>>();
+/// ```
+pub struct RetainedFilterBuffer<'f>(Buffer<'f>, PhantomData<Rc<()>>);
 
 impl<'f> Deref for RetainedFilterBuffer<'f> {
     type Target = Buffer<'f>;
@@ -155,11 +165,6 @@ impl DerefMut for RetainedFilterBuffer<'_> {
         &mut self.0
     }
 }
-
-// SAFETY: A retained guard uniquely owns the dequeued buffer. Moving that
-// ownership does not create aliases, mapped storage remains valid until the
-// guard queues it, and `pw_filter_queue_buffer` is documented as RT-safe.
-unsafe impl Send for RetainedFilterBuffer<'_> {}
 
 impl Drop for Buffer<'_> {
     fn drop(&mut self) {
