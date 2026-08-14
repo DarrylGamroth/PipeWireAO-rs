@@ -4,11 +4,15 @@
 //! A pass-through mono DSP filter using `pw_filter`.
 
 use pipewire as pw;
-use pw::{filter::FilterPortRef, properties::properties, spa};
+use pw::{
+    filter::{FilterListenerRc, FilterPortRc},
+    properties::properties,
+    spa,
+};
 
-struct Ports<'filter> {
-    input: FilterPortRef<'filter>,
-    output: FilterPortRef<'filter>,
+struct Ports {
+    input: FilterPortRc,
+    output: FilterPortRc,
 }
 
 fn main() -> Result<(), pw::Error> {
@@ -17,8 +21,14 @@ fn main() -> Result<(), pw::Error> {
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
-    let filter = pw::filter::FilterBox::new(
-        &core,
+    let _filter = build_filter(core)?;
+    mainloop.run();
+    Ok(())
+}
+
+fn build_filter(core: pw::core::CoreRc) -> Result<FilterListenerRc<'static, Ports>, pw::Error> {
+    let filter = pw::filter::FilterRc::new(
+        core,
         "rust-filter",
         properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
@@ -47,11 +57,8 @@ fn main() -> Result<(), pw::Error> {
         &mut [],
     )?;
 
-    let _listener = filter
-        .add_local_listener_with_user_data(Ports {
-            input: input.as_ref(),
-            output: output.as_ref(),
-        })
+    let listener = filter
+        .add_local_listener_with_user_data(Ports { input, output })
         .process(|_, ports, position| {
             let Some(position) = position else {
                 return;
@@ -70,6 +77,5 @@ fn main() -> Result<(), pw::Error> {
         .register()?;
 
     filter.connect(pw::filter::FilterFlags::RT_PROCESS, &mut [])?;
-    mainloop.run();
-    Ok(())
+    Ok(listener)
 }

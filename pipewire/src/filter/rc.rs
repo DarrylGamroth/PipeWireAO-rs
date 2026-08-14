@@ -2,15 +2,20 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
+    ffi,
     ffi::{CStr, CString},
     ops::Deref,
+    pin::Pin,
     ptr,
     rc::{Rc, Weak},
 };
 
-use crate::{core::CoreRc, properties::PropertiesBox, Error};
+use crate::{buffer::Buffer, core::CoreRc, properties::PropertiesBox, Error};
+use spa::utils::result::SpaResult;
 
-use super::{Filter, FilterBox};
+use super::{
+    Filter, FilterBox, FilterPortFlags, FilterPortRef, FilterState, ListenerLocalCallbacks,
+};
 
 #[derive(Debug)]
 struct FilterRcInner {
@@ -54,6 +59,57 @@ impl FilterRc {
             weak: Rc::downgrade(&self.inner),
         }
     }
+
+    /// Creates an owned listener builder that retains this filter.
+    ///
+    /// Callback data may own [`FilterPortRc`] values, allowing the registered
+    /// listener to be retained in a reusable node value without self-references.
+    #[must_use = "Use the builder to register event callbacks"]
+    pub fn add_local_listener_with_user_data<'a, D: 'a>(
+        &self,
+        user_data: D,
+    ) -> ListenerLocalRcBuilder<'a, D> {
+        let mut callbacks = ListenerLocalCallbacks::with_user_data(user_data);
+        callbacks.filter = ptr::NonNull::new(self.as_raw_ptr());
+        ListenerLocalRcBuilder {
+            filter: self.clone(),
+            callbacks,
+        }
+    }
+
+    /// Creates an owned listener builder with default callback data.
+    #[must_use = "Use the builder to register event callbacks"]
+    pub fn add_local_listener<'a, D: Default + 'a>(&self) -> ListenerLocalRcBuilder<'a, D> {
+        self.add_local_listener_with_user_data(D::default())
+    }
+
+    /// Adds an owned port whose registration retains this filter.
+    pub fn add_port_with_user_data<D>(
+        &self,
+        direction: spa::utils::Direction,
+        flags: FilterPortFlags,
+        properties: PropertiesBox,
+        params: &mut [&spa::pod::Pod],
+        user_data: D,
+    ) -> Result<FilterPortRc<D>, Error> {
+        let port_data = self.add_port_raw(direction, flags, properties, params)?;
+        Ok(FilterPortRc {
+            filter: self.clone(),
+            port_data,
+            user_data,
+        })
+    }
+
+    /// Adds an owned port without application-specific port data.
+    pub fn add_port(
+        &self,
+        direction: spa::utils::Direction,
+        flags: FilterPortFlags,
+        properties: PropertiesBox,
+        params: &mut [&spa::pod::Pod],
+    ) -> Result<FilterPortRc<()>, Error> {
+        self.add_port_with_user_data(direction, flags, properties, params, ())
+    }
 }
 
 impl Deref for FilterRc {
@@ -79,5 +135,211 @@ impl FilterWeak {
     /// Attempts to upgrade this weak reference.
     pub fn upgrade(&self) -> Option<FilterRc> {
         self.weak.upgrade().map(|inner| FilterRc { inner })
+    }
+}
+
+/// An owned filter-port registration that retains its shared filter.
+///
+/// This handle exposes only port operations. It deliberately does not expose
+/// or clone the retained [`FilterRc`] from a process callback.
+pub struct FilterPortRc<D = ()> {
+    pub(super) filter: FilterRc,
+    pub(super) port_data: ptr::NonNull<ffi::c_void>,
+    user_data: D,
+}
+
+impl<D> FilterPortRc<D> {
+    /// Returns the application data stored with this port handle.
+    pub fn user_data(&self) -> &D {
+        &self.user_data
+    }
+
+    /// Returns mutable application data stored with this port handle.
+    pub fn user_data_mut(&mut self) -> &mut D {
+        &mut self.user_data
+    }
+
+    /// Returns an opaque borrowed port reference suitable for identity checks.
+    pub fn as_ref(&self) -> FilterPortRef<'_> {
+        FilterPortRef {
+            port_data: self.port_data,
+            filter: ptr::NonNull::new(self.filter.as_raw_ptr()).expect("filter cannot be null"),
+            lifetime: std::marker::PhantomData,
+        }
+    }
+
+    /// Takes an available buffer from this port.
+    pub fn dequeue_buffer(&self) -> Option<Buffer<'_>> {
+        unsafe { Buffer::from_filter_raw(self.dequeue_raw_buffer(), self.port_data) }
+    }
+
+    /// Takes an available raw buffer from this port.
+    ///
+    /// # Safety
+    ///
+    /// The returned buffer, when non-null, must be queued back to this port.
+    pub unsafe fn dequeue_raw_buffer(&self) -> *mut pw_sys::pw_buffer {
+        pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr())
+    }
+
+    /// Queues a raw buffer back to this port.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must have been dequeued from this port and not already queued.
+    pub unsafe fn queue_raw_buffer(&self, buffer: *mut pw_sys::pw_buffer) -> Result<(), Error> {
+        let result = pw_sys::pw_filter_queue_buffer(self.port_data.as_ptr(), buffer);
+        SpaResult::from_c(result).into_result()?;
+        Ok(())
+    }
+
+    /// Gets the port's DSP buffer pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must use the negotiated DSP format and `n_samples` to access
+    /// the returned memory with the correct type and extent.
+    pub unsafe fn dsp_buffer(&self, n_samples: u32) -> *mut ffi::c_void {
+        pw_sys::pw_filter_get_dsp_buffer(self.port_data.as_ptr(), n_samples)
+    }
+}
+
+impl<D> Drop for FilterPortRc<D> {
+    fn drop(&mut self) {
+        unsafe {
+            pw_sys::pw_filter_remove_port(self.port_data.as_ptr());
+        }
+    }
+}
+
+// SAFETY: the retained Rc is never exposed or mutated from a callback. Shared
+// access is limited to PipeWire's documented RT-safe port operations and
+// immutable pointer identity. Listener removal precedes callback-data drop.
+unsafe impl<D: Sync> Sync for FilterPortRc<D> {}
+
+/// Builder for local callbacks that retains a shared filter.
+pub struct ListenerLocalRcBuilder<'a, D> {
+    filter: FilterRc,
+    callbacks: ListenerLocalCallbacks<'a, D>,
+}
+
+impl<'a, D> ListenerLocalRcBuilder<'a, D> {
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn state_changed<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Filter, &D, FilterState, FilterState) + Send + 'a,
+    {
+        *self.callbacks.state_changed.get_mut() = Some(Box::new(callback));
+        self
+    }
+
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn io_changed<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, *mut ffi::c_void, u32) + Send + 'a,
+    {
+        *self.callbacks.io_changed.get_mut() = Some(Box::new(callback));
+        self
+    }
+
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn param_changed<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Filter, &D, Option<FilterPortRef<'_>>, u32, Option<&spa::pod::Pod>) + Send + 'a,
+    {
+        *self.callbacks.param_changed.get_mut() = Some(Box::new(callback));
+        self
+    }
+
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn add_buffer<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Filter, &D, FilterPortRef<'_>, *mut pw_sys::pw_buffer) + Send + 'a,
+    {
+        *self.callbacks.add_buffer.get_mut() = Some(Box::new(callback));
+        self
+    }
+
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn remove_buffer<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Filter, &D, FilterPortRef<'_>, *mut pw_sys::pw_buffer) + Send + 'a,
+    {
+        *self.callbacks.remove_buffer.get_mut() = Some(Box::new(callback));
+        self
+    }
+
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn process<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Filter, &D, Option<&spa_sys::spa_io_position>) + Send + 'a,
+    {
+        *self.callbacks.process.get_mut() = Some(Box::new(callback));
+        self
+    }
+
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn drained<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Filter, &D) + Send + 'a,
+    {
+        *self.callbacks.drained.get_mut() = Some(Box::new(callback));
+        self
+    }
+
+    #[cfg(feature = "v0_3_39")]
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn command<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Filter, &D, *const spa_sys::spa_command) + Send + 'a,
+    {
+        *self.callbacks.command.get_mut() = Some(Box::new(callback));
+        self
+    }
+
+    /// Registers the selected callbacks and retains their filter.
+    pub fn register(self) -> Result<FilterListenerRc<'a, D>, Error>
+    where
+        D: Sync,
+    {
+        let (events, data) = self.callbacks.into_raw();
+        let (listener, data) = unsafe {
+            let listener: Box<spa_sys::spa_hook> = Box::new(std::mem::zeroed());
+            let raw_listener = Box::into_raw(listener);
+            let raw_data = Box::into_raw(data);
+            pw_sys::pw_filter_add_listener(
+                self.filter.as_raw_ptr(),
+                raw_listener,
+                events.as_ref().get_ref(),
+                raw_data.cast(),
+            );
+            (Box::from_raw(raw_listener), Box::from_raw(raw_data))
+        };
+        Ok(FilterListenerRc {
+            listener,
+            _events: events,
+            _data: data,
+            _filter: self.filter,
+        })
+    }
+}
+
+/// Owned filter callbacks that retain their shared filter.
+#[must_use = "Keep the listener alive in order to receive events"]
+pub struct FilterListenerRc<'a, D> {
+    listener: Box<spa_sys::spa_hook>,
+    _events: Pin<Box<pw_sys::pw_filter_events>>,
+    _data: Box<ListenerLocalCallbacks<'a, D>>,
+    _filter: FilterRc,
+}
+
+impl<D> FilterListenerRc<'_, D> {
+    /// Stops receiving events by consuming this listener.
+    pub fn unregister(self) {}
+}
+
+impl<D> Drop for FilterListenerRc<'_, D> {
+    fn drop(&mut self) {
+        spa::utils::hook::remove(*self.listener);
     }
 }

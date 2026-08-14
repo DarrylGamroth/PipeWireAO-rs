@@ -98,18 +98,7 @@ impl Filter {
         params: &mut [&spa::pod::Pod],
         user_data: D,
     ) -> Result<FilterPort<'_, D>, Error> {
-        let port_data = unsafe {
-            pw_sys::pw_filter_add_port(
-                self.as_raw_ptr(),
-                direction.as_raw(),
-                flags.bits(),
-                0,
-                properties.into_raw(),
-                params.as_mut_ptr().cast(),
-                params.len() as u32,
-            )
-        };
-        let port_data = ptr::NonNull::new(port_data).ok_or(Error::CreationFailed)?;
+        let port_data = self.add_port_raw(direction, flags, properties, params)?;
         Ok(FilterPort {
             filter: self,
             port_data,
@@ -126,6 +115,27 @@ impl Filter {
         params: &mut [&spa::pod::Pod],
     ) -> Result<FilterPort<'_, ()>, Error> {
         self.add_port_with_user_data(direction, flags, properties, params, ())
+    }
+
+    fn add_port_raw(
+        &self,
+        direction: spa::utils::Direction,
+        flags: FilterPortFlags,
+        properties: PropertiesBox,
+        params: &mut [&spa::pod::Pod],
+    ) -> Result<ptr::NonNull<ffi::c_void>, Error> {
+        let port_data = unsafe {
+            pw_sys::pw_filter_add_port(
+                self.as_raw_ptr(),
+                direction.as_raw(),
+                flags.bits(),
+                0,
+                properties.into_raw(),
+                params.as_mut_ptr().cast(),
+                params.len() as u32,
+            )
+        };
+        ptr::NonNull::new(port_data).ok_or(Error::CreationFailed)
     }
 
     /// Connects all filter ports to the graph.
@@ -320,6 +330,7 @@ pub struct FilterTrigger<'f> {
     lifetime: PhantomData<&'f Filter>,
 }
 
+#[cfg(feature = "v0_3_77")]
 impl FilterTrigger<'_> {
     /// Requests one graph iteration for the associated trigger or driver
     /// filter.
@@ -332,6 +343,7 @@ impl FilterTrigger<'_> {
 
 // SAFETY: `FilterTrigger` exposes only `pw_filter_trigger_process`, documented
 // by PipeWire as RT-safe. The lifetime prevents use after filter destruction.
+#[cfg(feature = "v0_3_77")]
 unsafe impl Send for FilterTrigger<'_> {}
 
 /// An owned registration for one filter port.
@@ -469,6 +481,11 @@ impl<'f> FilterPortRef<'f> {
 
     /// Tests whether this reference identifies an owned port handle.
     pub fn is<D>(&self, port: &FilterPort<'_, D>) -> bool {
+        self.port_data == port.port_data && self.filter.as_ptr() == port.filter.as_raw_ptr()
+    }
+
+    /// Tests whether this reference identifies an owned shared-filter port.
+    pub fn is_rc<D>(&self, port: &FilterPortRc<D>) -> bool {
         self.port_data == port.port_data && self.filter.as_ptr() == port.filter.as_raw_ptr()
     }
 }
