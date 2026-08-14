@@ -9,6 +9,7 @@ use std::{
     ptr,
     rc::{Rc, Weak},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
@@ -64,6 +65,37 @@ impl FilterRc {
         FilterWeak {
             weak: Rc::downgrade(&self.inner),
         }
+    }
+
+    /// Returns an owned RT trigger that retains this filter.
+    #[cfg(feature = "v0_3_77")]
+    pub fn trigger_handle_rc(&self) -> FilterTriggerRc {
+        FilterTriggerRc {
+            filter: ptr::NonNull::new(self.as_raw_ptr()).expect("filter cannot be null"),
+            _owner: self.clone(),
+        }
+    }
+
+    /// Registers a timer on this filter's assigned data loop while retaining
+    /// the filter for the complete timer lifetime.
+    #[cfg(feature = "v1_2_0")]
+    pub fn add_timer_from_thread_rc<F>(&self, callback: F) -> Result<FilterTimerRc, Error>
+    where
+        F: Fn(u64) + Send + 'static,
+    {
+        let data_loop = self.data_loop().ok_or(Error::CreationFailed)?;
+        let source = data_loop.add_timer_from_thread(callback)?;
+        // SAFETY: `FilterTimerRc` retains this filter, which retains the
+        // assigned PipeWire data loop. Its source field is dropped first.
+        let source = unsafe {
+            std::mem::transmute::<crate::loop_::TimerSource<'_>, crate::loop_::TimerSource<'static>>(
+                source,
+            )
+        };
+        Ok(FilterTimerRc {
+            source,
+            _owner: self.clone(),
+        })
     }
 
     /// Creates an owned listener builder that retains this filter.
@@ -122,6 +154,44 @@ impl FilterRc {
         params: &mut [&spa::pod::Pod],
     ) -> Result<FilterPortRc<()>, Error> {
         self.add_port_with_user_data(direction, flags, properties, params, ())
+    }
+}
+
+/// Owned handle that requests processing while retaining its filter.
+#[cfg(feature = "v0_3_77")]
+pub struct FilterTriggerRc {
+    filter: ptr::NonNull<pw_sys::pw_filter>,
+    _owner: FilterRc,
+}
+
+#[cfg(feature = "v0_3_77")]
+impl FilterTriggerRc {
+    /// Requests one graph iteration for the retained trigger filter.
+    pub fn trigger_process(&self) -> Result<(), Error> {
+        let result = unsafe { pw_sys::pw_filter_trigger_process(self.filter.as_ptr()) };
+        SpaResult::from_c(result).into_result()?;
+        Ok(())
+    }
+}
+
+// SAFETY: the Rc owner is retained but never accessed or cloned by the data
+// thread. The handle exposes only PipeWire's documented RT-safe trigger call
+// and is dropped with its listener on the control thread.
+#[cfg(feature = "v0_3_77")]
+unsafe impl Send for FilterTriggerRc {}
+
+/// Owned timer registered on a retained filter's assigned data loop.
+#[cfg(feature = "v1_2_0")]
+pub struct FilterTimerRc {
+    source: crate::loop_::TimerSource<'static>,
+    _owner: FilterRc,
+}
+
+#[cfg(feature = "v1_2_0")]
+impl FilterTimerRc {
+    /// Arms, rearms, or disables this timer.
+    pub fn update_timer(&self, value: Option<Duration>, interval: Option<Duration>) -> SpaResult {
+        self.source.update_timer(value, interval)
     }
 }
 
