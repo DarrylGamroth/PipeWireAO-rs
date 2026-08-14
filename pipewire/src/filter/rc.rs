@@ -8,9 +8,15 @@ use std::{
     pin::Pin,
     ptr,
     rc::{Rc, Weak},
+    sync::Arc,
 };
 
-use crate::{buffer::Buffer, core::CoreRc, properties::PropertiesBox, Error};
+use crate::{
+    buffer::{Buffer, RetainedFilterBufferRc},
+    core::CoreRc,
+    properties::PropertiesBox,
+    Error,
+};
 use spa::utils::result::SpaResult;
 
 use super::{
@@ -93,9 +99,16 @@ impl FilterRc {
         user_data: D,
     ) -> Result<FilterPortRc<D>, Error> {
         let port_data = self.add_port_raw(direction, flags, properties, params)?;
-        Ok(FilterPortRc {
+        // The atomic count supports the explicitly non-Send retained-buffer
+        // handoff. The registration itself remains thread-affine because it
+        // contains `FilterRc`; only a narrower owner may transfer its guard.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let registration = Arc::new(FilterPortRegistration {
             filter: self.clone(),
             port_data,
+        });
+        Ok(FilterPortRc {
+            registration,
             user_data,
         })
     }
@@ -143,9 +156,21 @@ impl FilterWeak {
 /// This handle exposes only port operations. It deliberately does not expose
 /// or clone the retained [`FilterRc`] from a process callback.
 pub struct FilterPortRc<D = ()> {
-    pub(super) filter: FilterRc,
-    pub(super) port_data: ptr::NonNull<ffi::c_void>,
+    pub(super) registration: Arc<FilterPortRegistration>,
     user_data: D,
+}
+
+pub(crate) struct FilterPortRegistration {
+    pub(crate) filter: FilterRc,
+    pub(crate) port_data: ptr::NonNull<ffi::c_void>,
+}
+
+impl Drop for FilterPortRegistration {
+    fn drop(&mut self) {
+        unsafe {
+            pw_sys::pw_filter_remove_port(self.port_data.as_ptr());
+        }
+    }
 }
 
 impl<D> FilterPortRc<D> {
@@ -162,15 +187,28 @@ impl<D> FilterPortRc<D> {
     /// Returns an opaque borrowed port reference suitable for identity checks.
     pub fn as_ref(&self) -> FilterPortRef<'_> {
         FilterPortRef {
-            port_data: self.port_data,
-            filter: ptr::NonNull::new(self.filter.as_raw_ptr()).expect("filter cannot be null"),
+            port_data: self.registration.port_data,
+            filter: ptr::NonNull::new(self.registration.filter.as_raw_ptr())
+                .expect("filter cannot be null"),
             lifetime: std::marker::PhantomData,
         }
     }
 
     /// Takes an available buffer from this port.
     pub fn dequeue_buffer(&self) -> Option<Buffer<'_>> {
-        unsafe { Buffer::from_filter_raw(self.dequeue_raw_buffer(), self.port_data) }
+        unsafe { Buffer::from_filter_raw(self.dequeue_raw_buffer(), self.registration.port_data) }
+    }
+
+    /// Takes an available buffer while retaining its owned port registration.
+    ///
+    /// The returned guard is intended for a bounded handoff that returns the
+    /// buffer after the callback. It does not implement `Send`; a narrower
+    /// application wrapper must prove any cross-thread topology.
+    pub fn dequeue_retained_buffer(&self) -> Option<RetainedFilterBufferRc> {
+        unsafe {
+            Buffer::from_filter_rc_raw(self.dequeue_raw_buffer(), Arc::clone(&self.registration))
+                .map(RetainedFilterBufferRc::from_buffer)
+        }
     }
 
     /// Takes an available raw buffer from this port.
@@ -179,7 +217,7 @@ impl<D> FilterPortRc<D> {
     ///
     /// The returned buffer, when non-null, must be queued back to this port.
     pub unsafe fn dequeue_raw_buffer(&self) -> *mut pw_sys::pw_buffer {
-        pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr())
+        pw_sys::pw_filter_dequeue_buffer(self.registration.port_data.as_ptr())
     }
 
     /// Queues a raw buffer back to this port.
@@ -188,7 +226,7 @@ impl<D> FilterPortRc<D> {
     ///
     /// `buffer` must have been dequeued from this port and not already queued.
     pub unsafe fn queue_raw_buffer(&self, buffer: *mut pw_sys::pw_buffer) -> Result<(), Error> {
-        let result = pw_sys::pw_filter_queue_buffer(self.port_data.as_ptr(), buffer);
+        let result = pw_sys::pw_filter_queue_buffer(self.registration.port_data.as_ptr(), buffer);
         SpaResult::from_c(result).into_result()?;
         Ok(())
     }
@@ -200,15 +238,7 @@ impl<D> FilterPortRc<D> {
     /// The caller must use the negotiated DSP format and `n_samples` to access
     /// the returned memory with the correct type and extent.
     pub unsafe fn dsp_buffer(&self, n_samples: u32) -> *mut ffi::c_void {
-        pw_sys::pw_filter_get_dsp_buffer(self.port_data.as_ptr(), n_samples)
-    }
-}
-
-impl<D> Drop for FilterPortRc<D> {
-    fn drop(&mut self) {
-        unsafe {
-            pw_sys::pw_filter_remove_port(self.port_data.as_ptr());
-        }
+        pw_sys::pw_filter_get_dsp_buffer(self.registration.port_data.as_ptr(), n_samples)
     }
 }
 

@@ -486,7 +486,8 @@ impl<'f> FilterPortRef<'f> {
 
     /// Tests whether this reference identifies an owned shared-filter port.
     pub fn is_rc<D>(&self, port: &FilterPortRc<D>) -> bool {
-        self.port_data == port.port_data && self.filter.as_ptr() == port.filter.as_raw_ptr()
+        self.port_data == port.registration.port_data
+            && self.filter.as_ptr() == port.registration.filter.as_raw_ptr()
     }
 }
 

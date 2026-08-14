@@ -7,6 +7,9 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::Arc;
+
+use crate::filter::FilterPortRegistration;
 
 pub struct Buffer<'s> {
     buf: NonNull<pw_sys::pw_buffer>,
@@ -20,6 +23,7 @@ pub struct Buffer<'s> {
 enum BufferOwner<'a> {
     Stream(&'a Stream),
     FilterPort(NonNull<std::ffi::c_void>, std::marker::PhantomData<&'a ()>),
+    FilterPortRc(Arc<FilterPortRegistration>),
 }
 
 impl<'s> Buffer<'s> {
@@ -40,6 +44,16 @@ impl<'s> Buffer<'s> {
         NonNull::new(buf).map(|buf| Buffer {
             buf,
             owner: BufferOwner::FilterPort(port_data, std::marker::PhantomData),
+        })
+    }
+
+    pub(crate) unsafe fn from_filter_rc_raw(
+        buf: *mut pw_sys::pw_buffer,
+        registration: Arc<FilterPortRegistration>,
+    ) -> Option<Buffer<'static>> {
+        NonNull::new(buf).map(|buf| Buffer {
+            buf,
+            owner: BufferOwner::FilterPortRc(registration),
         })
     }
 
@@ -166,13 +180,46 @@ impl DerefMut for RetainedFilterBuffer<'_> {
     }
 }
 
+/// An exclusively owned buffer that retains its filter-port registration.
+///
+/// This guard does not implement `Send`. Cross-thread transfer requires a
+/// narrower owner that proves a single-producer/single-consumer topology and
+/// returns the buffer before filter teardown.
+pub struct RetainedFilterBufferRc(Buffer<'static>, PhantomData<Rc<()>>);
+
+impl RetainedFilterBufferRc {
+    pub(crate) fn from_buffer(buffer: Buffer<'static>) -> Self {
+        Self(buffer, PhantomData)
+    }
+}
+
+impl Deref for RetainedFilterBufferRc {
+    type Target = Buffer<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for RetainedFilterBufferRc {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl Drop for Buffer<'_> {
     fn drop(&mut self) {
         unsafe {
-            match self.owner {
+            match &self.owner {
                 BufferOwner::Stream(stream) => stream.queue_raw_buffer(self.buf.as_ptr()),
                 BufferOwner::FilterPort(port_data, _) => {
                     pw_sys::pw_filter_queue_buffer(port_data.as_ptr(), self.buf.as_ptr());
+                }
+                BufferOwner::FilterPortRc(registration) => {
+                    pw_sys::pw_filter_queue_buffer(
+                        registration.port_data.as_ptr(),
+                        self.buf.as_ptr(),
+                    );
                 }
             }
         }
