@@ -25,6 +25,12 @@ use super::{
     Filter, FilterBox, FilterPortFlags, FilterPortRef, FilterState, ListenerLocalCallbacks,
 };
 
+/// SPA I/O identifier for PipeWire's graph-independent buffer queue area.
+///
+/// This extension uses the ABI value assigned after `SPA_IO_Memory` and is
+/// available when both endpoints and the daemon advertise buffer queue I/O.
+pub const BUFFER_QUEUE_IO_ID: u32 = 11;
+
 #[derive(Debug)]
 struct FilterRcInner {
     filter: FilterBox<'static>,
