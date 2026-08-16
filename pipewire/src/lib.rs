@@ -177,7 +177,7 @@ use std::ptr;
 /// Initialize PipeWire
 ///
 /// Initialize the PipeWire system and set up debugging
-/// through the environment variable `PIPEWIRE_DEBUG`.
+/// through the environment variable `PIPEWIREAO_DEBUG`.
 pub fn init() {
     use std::sync::OnceLock;
     static INITIALIZED: OnceLock<()> = OnceLock::new();

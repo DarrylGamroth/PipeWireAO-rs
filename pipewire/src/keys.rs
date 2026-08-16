@@ -97,7 +97,7 @@ key_constant!(HOST_NAME, PW_KEY_HOST_NAME,
     /// The host name of the machine
 );
 key_constant!(CORE_NAME, PW_KEY_CORE_NAME,
-    /// The name of the core. Default is `pipewire-<username>-<pid>`, overwritten by env(PIPEWIRE_CORE)
+    /// The name of the core. Overridden by env(PIPEWIREAO_CORE).
 );
 key_constant!(CORE_VERSION, PW_KEY_CORE_VERSION,
     /// The version of the core.
@@ -124,7 +124,7 @@ key_constant!(PRIORITY_DRIVER, PW_KEY_PRIORITY_DRIVER,
     /// priority to be a driver
 );
 key_constant!(REMOTE_NAME, PW_KEY_REMOTE_NAME,
-    /// The name of the remote to connect to, default pipewire-0, overwritten by env(PIPEWIRE_REMOTE)
+    /// The name of the remote to connect to, default `pipewire-ao`, overridden by env(PIPEWIREAO_REMOTE).
 );
 key_constant!(REMOTE_INTENTION, PW_KEY_REMOTE_INTENTION,
     /// The intention of the remote connection, "generic", "screencast"
