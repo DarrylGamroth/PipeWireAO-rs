@@ -5,15 +5,15 @@ use std::{
     cell::Cell,
     ffi,
     ffi::{CStr, CString},
+    io,
     ops::Deref,
+    os::fd::{BorrowedFd, RawFd},
     pin::Pin,
     ptr,
     rc::{Rc, Weak},
     sync::Arc,
+    time::{Duration, Instant},
 };
-
-#[cfg(feature = "v1_2_0")]
-use std::time::Duration;
 
 use crate::{
     buffer::{Buffer, RetainedFilterBufferRc},
@@ -29,9 +29,50 @@ use super::{
 
 /// SPA I/O identifier for PipeWire's graph-independent latest-buffer area.
 ///
-/// This extension uses the ABI value assigned after `SPA_IO_Memory` and is
+/// This extension uses the ABI value assigned after `SPA_IO_AsyncBuffers` and is
 /// available when both endpoints and the daemon advertise latest-buffer I/O.
 pub const BUFFER_LATEST_IO_ID: u32 = 11;
+
+/// SPA I/O identifier for the process-local latest-buffer notification fd.
+pub const BUFFER_LATEST_NOTIFY_IO_ID: u32 = 12;
+
+/// Input-port property used to select latest-buffer receiver waiting.
+pub const BUFFER_LATEST_WAIT_PROPERTY: &str = "port.buffer-latest.wait";
+
+/// Receiver-side waiting policy for a graph-independent latest-buffer link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BufferLatestWaitPolicy {
+    /// Poll shared state continuously without allocating or signaling an fd.
+    BusySpin,
+    /// Recheck shared state around a blocking eventfd wait.
+    EventFd,
+    /// Poll shared state for a bounded number of iterations, then use eventfd.
+    Hybrid { spin_iterations: u32 },
+}
+
+impl BufferLatestWaitPolicy {
+    /// Value to set on [`BUFFER_LATEST_WAIT_PROPERTY`] before connecting.
+    pub const fn port_property_value(self) -> &'static str {
+        match self {
+            Self::BusySpin => "busy-spin",
+            Self::EventFd => "eventfd",
+            Self::Hybrid { .. } => "hybrid",
+        }
+    }
+
+    /// Configures port properties for this policy before the port is added.
+    pub fn configure_port(self, properties: &mut crate::properties::Properties) {
+        properties.insert(BUFFER_LATEST_WAIT_PROPERTY, self.port_property_value());
+    }
+
+    const fn notification_spin_iterations(self) -> Option<u32> {
+        match self {
+            Self::BusySpin => None,
+            Self::EventFd => Some(0),
+            Self::Hybrid { spin_iterations } => Some(spin_iterations),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct FilterRcInner {
@@ -368,6 +409,171 @@ impl FilterBufferLatestPort<'_> {
             Buffer::from_filter_raw(buffer, self.port_data)
         }
     }
+
+    /// Returns the borrowed advisory eventfd selected for this port.
+    ///
+    /// The descriptor is owned by the connected filter and must not be closed.
+    /// `ENODEV` means the port selected [`BufferLatestWaitPolicy::BusySpin`].
+    pub fn notification_fd(&self) -> io::Result<BorrowedFd<'_>> {
+        let fd = self.notification_raw_fd()?;
+        // SAFETY: PipeWire owns this descriptor for at least the lifetime of
+        // the connected port, which this handle borrows exclusively.
+        Ok(unsafe { BorrowedFd::borrow_raw(fd) })
+    }
+
+    /// Waits until a buffer is available using the selected receiver policy.
+    ///
+    /// Eventfd is advisory: this method always treats latest-buffer shared
+    /// state as authoritative and rechecks it before and after draining or
+    /// waiting. EventFd and Hybrid return an error when no notification fd was
+    /// negotiated; they never silently fall back to busy-spinning.
+    ///
+    /// This form has no deadline. The caller must arrange an in-band terminal
+    /// buffer or another process-level shutdown mechanism.
+    pub fn wait_dequeue(&mut self, policy: BufferLatestWaitPolicy) -> io::Result<Buffer<'_>> {
+        self.wait_dequeue_inner(policy, None).map(Option::unwrap)
+    }
+
+    /// Waits until a buffer is available or `deadline` is reached.
+    ///
+    /// A buffer already visible at the deadline is returned. `Ok(None)` means
+    /// no buffer was visible before the bounded wait ended.
+    pub fn wait_dequeue_until(
+        &mut self,
+        policy: BufferLatestWaitPolicy,
+        deadline: Instant,
+    ) -> io::Result<Option<Buffer<'_>>> {
+        self.wait_dequeue_inner(policy, Some(deadline))
+    }
+
+    fn notification_raw_fd(&self) -> io::Result<RawFd> {
+        let result = unsafe { pw_sys::pw_filter_get_buffer_latest_fd(self.port_data.as_ptr()) };
+        if result < 0 {
+            Err(io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result)
+        }
+    }
+
+    fn wait_dequeue_inner(
+        &mut self,
+        policy: BufferLatestWaitPolicy,
+        deadline: Option<Instant>,
+    ) -> io::Result<Option<Buffer<'_>>> {
+        let notification = policy
+            .notification_spin_iterations()
+            .map(|spin_iterations| self.notification_raw_fd().map(|fd| (fd, spin_iterations)))
+            .transpose()?;
+        let mut spins_remaining = notification.map_or(0, |(_, spins)| spins);
+
+        loop {
+            let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr()) };
+            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, self.port_data) } {
+                return Ok(Some(buffer));
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(None);
+            }
+
+            let Some((fd, hybrid_spins)) = notification else {
+                std::hint::spin_loop();
+                continue;
+            };
+            if spins_remaining > 0 {
+                spins_remaining -= 1;
+                std::hint::spin_loop();
+                continue;
+            }
+
+            drain_eventfd(fd)?;
+
+            // Close the check/drain race before sleeping. A publication either
+            // appears here or leaves the eventfd readable for poll below.
+            let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr()) };
+            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, self.port_data) } {
+                return Ok(Some(buffer));
+            }
+            if !poll_eventfd(fd, deadline)? {
+                return Ok(None);
+            }
+            spins_remaining = hybrid_spins;
+        }
+    }
+}
+
+fn drain_eventfd(fd: RawFd) -> io::Result<()> {
+    let mut count = 0u64;
+    loop {
+        let result = unsafe {
+            libc::read(
+                fd,
+                ptr::addr_of_mut!(count).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if result == std::mem::size_of::<u64>() as isize {
+            return Ok(());
+        }
+        if result >= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short read from latest-buffer eventfd",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => return Ok(()),
+            _ => return Err(error),
+        }
+    }
+}
+
+fn poll_eventfd(fd: RawFd, deadline: Option<Instant>) -> io::Result<bool> {
+    loop {
+        let timeout = match deadline {
+            None => -1,
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                poll_timeout_millis(remaining)
+            }
+        };
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(ptr::addr_of_mut!(descriptor), 1, timeout) };
+        if result > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            if descriptor.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "latest-buffer eventfd closed",
+                ));
+            }
+            return Ok(true);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn poll_timeout_millis(duration: Duration) -> libc::c_int {
+    duration
+        .as_millis()
+        .saturating_add(u128::from(duration.subsec_nanos() % 1_000_000 != 0))
+        .min(libc::c_int::MAX as u128) as libc::c_int
 }
 
 // SAFETY: construction requires an exclusive mutable borrow of the port and
@@ -499,5 +705,69 @@ impl<D> FilterListenerRc<'_, D> {
 impl<D> Drop for FilterListenerRc<'_, D> {
     fn drop(&mut self) {
         spa::utils::hook::remove(*self.listener);
+    }
+}
+
+#[cfg(test)]
+mod latest_wait_tests {
+    use super::*;
+
+    #[test]
+    fn policy_values_match_daemon_contract() {
+        assert_eq!(
+            BufferLatestWaitPolicy::BusySpin.port_property_value(),
+            "busy-spin"
+        );
+        assert_eq!(
+            BufferLatestWaitPolicy::EventFd.port_property_value(),
+            "eventfd"
+        );
+        assert_eq!(
+            BufferLatestWaitPolicy::Hybrid {
+                spin_iterations: 64
+            }
+            .port_property_value(),
+            "hybrid"
+        );
+    }
+
+    #[test]
+    fn poll_timeout_rounds_up_and_saturates() {
+        assert_eq!(poll_timeout_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout_millis(Duration::from_millis(1)), 1);
+        assert_eq!(
+            poll_timeout_millis(Duration::from_millis(1) + Duration::from_nanos(1)),
+            2
+        );
+        assert_eq!(poll_timeout_millis(Duration::MAX), libc::c_int::MAX);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eventfd_poll_and_drain_are_advisory() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let count = 3u64;
+        let written = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                ptr::addr_of!(count).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<u64>() as isize);
+
+        assert!(poll_eventfd(
+            fd.as_raw_fd(),
+            Some(Instant::now() + Duration::from_secs(1))
+        )
+        .expect("eventfd poll failed"));
+        drain_eventfd(fd.as_raw_fd()).expect("eventfd drain failed");
+        drain_eventfd(fd.as_raw_fd()).expect("stale eventfd drain must be harmless");
+        assert!(!poll_eventfd(fd.as_raw_fd(), Some(Instant::now()))
+            .expect("expired eventfd poll failed"));
     }
 }
