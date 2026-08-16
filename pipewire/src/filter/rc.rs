@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
+    cell::Cell,
     ffi,
     ffi::{CStr, CString},
     ops::Deref,
@@ -301,6 +302,26 @@ impl<D> FilterPortRc<D> {
         Ok(())
     }
 
+    /// Borrows this port for graph-independent buffer queue I/O on one worker.
+    ///
+    /// The returned handle is `Send` but not `Sync`. Its mutable borrow keeps
+    /// the port registration alive and prevents other safe port operations
+    /// until the worker returns it.
+    ///
+    /// # Safety
+    ///
+    /// The port must be connected by exactly one PipeWire buffer-queue link.
+    /// No graph process callback or other thread may dequeue or queue buffers
+    /// on this port while the handle exists. The worker must stop and return
+    /// the handle before the filter is disconnected.
+    pub unsafe fn buffer_queue(&mut self) -> FilterBufferQueuePort<'_> {
+        FilterBufferQueuePort {
+            port_data: self.registration.port_data,
+            lifetime: std::marker::PhantomData,
+            not_sync: std::marker::PhantomData,
+        }
+    }
+
     /// Gets the port's DSP buffer pointer.
     ///
     /// # Safety
@@ -316,6 +337,31 @@ impl<D> FilterPortRc<D> {
 // access is limited to PipeWire's documented RT-safe port operations and
 // immutable pointer identity. Listener removal precedes callback-data drop.
 unsafe impl<D: Sync> Sync for FilterPortRc<D> {}
+
+/// Exclusive worker-side access to one graph-independent filter buffer queue.
+///
+/// Obtain this handle with [`FilterPortRc::buffer_queue`]. A scoped worker is
+/// the natural way to satisfy its lifetime and teardown contract.
+pub struct FilterBufferQueuePort<'p> {
+    port_data: ptr::NonNull<ffi::c_void>,
+    lifetime: std::marker::PhantomData<&'p mut ()>,
+    not_sync: std::marker::PhantomData<Cell<()>>,
+}
+
+impl FilterBufferQueuePort<'_> {
+    /// Takes the next completed input buffer or reusable output buffer.
+    pub fn dequeue_buffer(&self) -> Option<Buffer<'_>> {
+        unsafe {
+            let buffer = pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr());
+            Buffer::from_filter_raw(buffer, self.port_data)
+        }
+    }
+}
+
+// SAFETY: construction requires an exclusive mutable borrow of the port and
+// an explicit promise that one queue-mode worker owns all buffer operations.
+// The lifetime prevents the port registration from being removed first.
+unsafe impl Send for FilterBufferQueuePort<'_> {}
 
 /// Builder for local callbacks that retains a shared filter.
 pub struct ListenerLocalRcBuilder<'a, D> {
