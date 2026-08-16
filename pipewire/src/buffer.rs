@@ -2,14 +2,18 @@ use super::stream::Stream;
 
 use spa::buffer::meta::Metadata;
 use spa::buffer::Data;
+use spa::utils::result::SpaResult;
+use std::cell::Cell;
 use std::convert::TryFrom;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::filter::FilterPortRegistration;
+use crate::Error;
 
 pub struct Buffer<'s> {
     buf: NonNull<pw_sys::pw_buffer>,
@@ -70,6 +74,49 @@ impl<'s> Buffer<'s> {
         } else {
             Err(self)
         }
+    }
+
+    /// Announces this filter output while retaining its progressive writer
+    /// lease.
+    ///
+    /// The caller must initialize the negotiated progressive metadata to its
+    /// active state before this operation. On success, the ordinary buffer
+    /// interface is hidden because whole-payload access is not safe while a
+    /// consumer may observe committed ranges. Dropping the returned guard ends
+    /// the producer lease exactly once; the producer must publish its terminal
+    /// state before doing so.
+    ///
+    /// This operation succeeds only for an output buffer dequeued from a
+    /// graph-independent latest-buffer filter port. On failure, the error
+    /// retains the buffer so the caller may recover it with
+    /// [`BeginProgressiveBufferError::into_buffer`].
+    pub fn begin_progressive(
+        self,
+    ) -> Result<ProgressiveFilterBuffer<'s>, BeginProgressiveBufferError<'s>> {
+        let port_data = match &self.owner {
+            BufferOwner::FilterPort(port_data, _) => *port_data,
+            _ => {
+                return Err(BeginProgressiveBufferError {
+                    kind: BeginProgressiveBufferErrorKind::WrongOwner,
+                    buffer: self,
+                });
+            }
+        };
+        let result = unsafe {
+            pw_sys::pw_filter_begin_progressive_buffer(port_data.as_ptr(), self.buf.as_ptr())
+        };
+        if let Err(error) = SpaResult::from_c(result).into_result() {
+            return Err(BeginProgressiveBufferError {
+                kind: BeginProgressiveBufferErrorKind::PipeWire(error.into()),
+                buffer: self,
+            });
+        }
+
+        Ok(ProgressiveFilterBuffer {
+            buffer: ManuallyDrop::new(self),
+            port_data,
+            not_sync: PhantomData,
+        })
     }
 
     pub fn datas_mut(&mut self) -> &mut [Data] {
@@ -151,6 +198,111 @@ impl<'s> Buffer<'s> {
         unsafe { self.buf.as_ref().requested }
     }
 }
+
+/// Error returned when a buffer cannot begin a progressive producer lease.
+pub struct BeginProgressiveBufferError<'f> {
+    kind: BeginProgressiveBufferErrorKind,
+    buffer: Buffer<'f>,
+}
+
+#[derive(Debug)]
+enum BeginProgressiveBufferErrorKind {
+    WrongOwner,
+    PipeWire(Error),
+}
+
+impl<'f> BeginProgressiveBufferError<'f> {
+    /// Returns the underlying PipeWire error, when the operation reached
+    /// PipeWire.
+    pub fn pipewire_error(&self) -> Option<&Error> {
+        match &self.kind {
+            BeginProgressiveBufferErrorKind::WrongOwner => None,
+            BeginProgressiveBufferErrorKind::PipeWire(error) => Some(error),
+        }
+    }
+
+    /// Recovers the buffer after a failed progressive announcement.
+    pub fn into_buffer(self) -> Buffer<'f> {
+        self.buffer
+    }
+}
+
+impl std::fmt::Debug for BeginProgressiveBufferError<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BeginProgressiveBufferError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for BeginProgressiveBufferError<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            BeginProgressiveBufferErrorKind::WrongOwner => {
+                formatter.write_str("buffer is not owned by a filter port")
+            }
+            BeginProgressiveBufferErrorKind::PipeWire(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for BeginProgressiveBufferError<'_> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.pipewire_error()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// An announced progressive filter output with an active producer lease.
+///
+/// This guard deliberately does not expose the ordinary safe [`Buffer`] API.
+/// The producer and consumer may own disjoint payload ranges concurrently, so
+/// a protocol-aware wrapper must use [`Self::buffer_mut_unchecked`] to create
+/// only references within the producer-owned suffix. Dropping the guard ends
+/// the producer lease; it does not publish application metadata on the
+/// producer's behalf.
+pub struct ProgressiveFilterBuffer<'f> {
+    buffer: ManuallyDrop<Buffer<'f>>,
+    port_data: NonNull<std::ffi::c_void>,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+impl<'f> ProgressiveFilterBuffer<'f> {
+    /// Borrows the underlying buffer for protocol-aware, range-limited access.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not construct any reference spanning payload bytes
+    /// concurrently owned by the consumer. Payload access must remain within
+    /// the producer-owned uncommitted suffix, and metadata access must follow
+    /// the negotiated progressive protocol.
+    pub unsafe fn buffer_mut_unchecked(&mut self) -> &mut Buffer<'f> {
+        &mut self.buffer
+    }
+
+    /// Returns the underlying PipeWire buffer pointer without granting payload
+    /// access.
+    pub fn as_raw_ptr(&self) -> *mut pw_sys::pw_buffer {
+        self.buffer.buf.as_ptr()
+    }
+}
+
+impl Drop for ProgressiveFilterBuffer<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            pw_sys::pw_filter_end_progressive_buffer(
+                self.port_data.as_ptr(),
+                self.buffer.buf.as_ptr(),
+            );
+        }
+    }
+}
+
+// SAFETY: construction verifies the filter-port owner and the C operation
+// accepts only an output latest-buffer port. The lifetime retains the exclusive
+// port borrow that produced the buffer, and this guard exposes no Sync access.
+unsafe impl Send for ProgressiveFilterBuffer<'_> {}
 
 /// An exclusively owned filter-port buffer retained beyond one callback.
 ///

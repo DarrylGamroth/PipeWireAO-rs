@@ -10,8 +10,10 @@ use std::{
     ptr,
     rc::{Rc, Weak},
     sync::Arc,
-    time::Duration,
 };
+
+#[cfg(feature = "v1_2_0")]
+use std::time::Duration;
 
 use crate::{
     buffer::{Buffer, RetainedFilterBufferRc},
