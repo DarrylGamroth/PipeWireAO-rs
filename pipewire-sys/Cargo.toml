@@ -1,18 +1,15 @@
 [package]
-name = "pipewire-sys"
+name = "pipewire-ao-sys"
 version.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 edition.workspace = true
-links = "pipewire-0.3"
+links = "pipewire-ao-0.3"
 categories.workspace = true
-description = "Rust FFI bindings for PipeWire"
-repository.workspace = true
+description = "Rust FFI bindings for PipeWireAO"
 license.workspace = true
 readme = "README.md"
-homepage.workspace = true
-documentation = "https://pipewire.pages.freedesktop.org/pipewire-rs/pipewire_sys/"
-keywords = ["ffi", "pipewire", "multimedia", "audio", "video"]
+keywords = ["ffi", "pipewire", "adaptive-optics", "realtime"]
 
 [dependencies]
 spa_sys.workspace = true
@@ -22,7 +19,8 @@ bindgen = { workspace = true, features = ["runtime"] }
 system-deps.workspace = true
 
 [package.metadata.system-deps]
-libpipewire = { name = "libpipewire-0.3", version = "0.3" }
+libpipewire = { name = "libpipewire-ao-0.3", version = "0.3" }
 
 [lib]
+name = "pipewire_sys"
 doctest = false # https://github.com/rust-lang/rust-bindgen/issues/1313

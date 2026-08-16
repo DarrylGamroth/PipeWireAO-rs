@@ -1,18 +1,15 @@
 [package]
-name = "libspa-sys"
+name = "libspa-ao-sys"
 version.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 edition.workspace = true
-links = "libspa-0.2"
+links = "libspa-ao-0.2"
 categories.workspace = true
-description = "Rust FFI bindings for libspa"
-repository.workspace = true
+description = "Rust FFI bindings for PipeWireAO SPA"
 license.workspace = true
 readme = "README.md"
-homepage.workspace = true
-documentation = "https://pipewire.pages.freedesktop.org/pipewire-rs/libspa_sys/"
-keywords = ["ffi", "pipewire", "multimedia", "audio", "video"]
+keywords = ["ffi", "pipewire", "adaptive-optics", "realtime"]
 
 [dependencies]
 
@@ -22,10 +19,11 @@ cc.workspace = true
 system-deps.workspace = true
 
 [package.metadata.system-deps]
-libspa = { name = "libspa-0.2", version = "0.2" }
-libpipewire = { name = "libpipewire-0.3", version = "0.3" }
+libspa = { name = "libspa-ao-0.2", version = "0.2" }
+libpipewire = { name = "libpipewire-ao-0.3", version = "0.3" }
 
 [lib]
+name = "libspa_sys"
 doctest = false # https://github.com/rust-lang/rust-bindgen/issues/1313
 
 [features]

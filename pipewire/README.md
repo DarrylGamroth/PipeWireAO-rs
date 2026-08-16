@@ -1,10 +1,11 @@
-# pipewire [![](https://img.shields.io/crates/v/pipewire.svg)](https://crates.io/crates/pipewire) [![](https://docs.rs/pipewire/badge.svg)](https://docs.rs/pipewire)
+# pipewire-ao
 
-[PipeWire](https://pipewire.org) bindings for Rust.
+Safe [PipeWireAO] bindings for Rust. The package links only to
+`libpipewire-ao-0.3`; it does not fall back to system PipeWire.
 
 These bindings are providing a safe API that can be used to interface with
-[PipeWire](https://pipewire.org).
+[PipeWireAO].
 
 ## Documentation
 
-See the [crate documentation](https://pipewire.pages.freedesktop.org/pipewire-rs/pipewire/).
+[PipeWireAO]: https://pipewire.org

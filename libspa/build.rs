@@ -4,12 +4,11 @@ fn main() {
 
     let libs = system_deps::Config::new()
         .probe()
-        .expect("Cannot find libspa");
-    let libspa = libs.get_by_name("libspa").unwrap();
+        .expect("Cannot find PipeWireAO SPA development files");
 
     cc::Build::new()
         .file("tests/pod.c")
         .flag("-Wno-missing-field-initializers")
-        .includes(&libspa.include_paths)
+        .includes(libs.all_include_paths())
         .compile("pod");
 }

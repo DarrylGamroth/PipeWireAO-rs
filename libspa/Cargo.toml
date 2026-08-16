@@ -1,17 +1,17 @@
 [package]
-name = "libspa"
+name = "libspa-ao"
 version.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 categories.workspace = true
-description = "Rust bindings for libspa"
-repository.workspace = true
+description = "Safe Rust bindings for PipeWireAO SPA"
 license.workspace = true
 readme = "README.md"
-homepage.workspace = true
-documentation = "https://pipewire.pages.freedesktop.org/pipewire-rs/libspa/"
-keywords = ["pipewire", "multimedia", "audio", "video"]
+keywords = ["pipewire", "adaptive-optics", "multimedia", "realtime"]
+
+[lib]
+name = "libspa"
 
 [dependencies]
 spa_sys.workspace = true
@@ -30,7 +30,8 @@ system-deps.workspace = true
 cc.workspace = true
 
 [package.metadata.system-deps]
-libspa = { name = "libspa-0.2", version = "0.2" }
+libspa = { name = "libspa-ao-0.2", version = "0.2" }
+libpipewire = { name = "libpipewire-ao-0.3", version = "0.3" }
 
 [features]
 v0_3_21 = []

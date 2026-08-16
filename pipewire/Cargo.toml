@@ -1,17 +1,17 @@
 [package]
-name = "pipewire"
+name = "pipewire-ao"
 version.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 categories.workspace = true
-description = "Rust bindings for PipeWire"
-repository.workspace = true
+description = "Safe Rust bindings for PipeWireAO"
 license.workspace = true
 readme = "README.md"
-homepage.workspace = true
-documentation = "https://pipewire.pages.freedesktop.org/pipewire-rs/pipewire/"
-keywords = ["pipewire", "multimedia", "audio", "video"]
+keywords = ["pipewire", "adaptive-optics", "multimedia", "realtime"]
+
+[lib]
+name = "pipewire"
 
 [dependencies]
 pw_sys.workspace = true

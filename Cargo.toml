@@ -11,21 +11,19 @@ members = [
 authors = ["Tom Wagner <tom.a.wagner@protonmail.com>", "Guillaume Desmottes <guillaume.desmottes@collabora.com>"]
 categories = ["api-bindings", "multimedia"]
 edition = "2021"
-homepage = "https://pipewire.org"
 license = "MIT"
-repository = "https://gitlab.freedesktop.org/pipewire/pipewire-rs"
 # When bumping MSRV, don't forget to update it also in .gitlab-ci.yml
 rust-version = "1.80"
 version = "0.10.1"
 
 [workspace.dependencies]
-pipewire = { path = "./pipewire" }
-pipewire-sys = { path = "./pipewire-sys" }
+pipewire = { package = "pipewire-ao", path = "./pipewire" }
+pipewire-sys = { package = "pipewire-ao-sys", path = "./pipewire-sys" }
 
 # Aliases
-pw_sys = { package = "pipewire-sys", version = "0.10", path = "./pipewire-sys" }
-spa_sys = { package = "libspa-sys", version = "0.10", path = "./libspa-sys" }
-spa = { package = "libspa", version = "0.10", path = "./libspa" }
+pw_sys = { package = "pipewire-ao-sys", version = "0.10", path = "./pipewire-sys" }
+spa_sys = { package = "libspa-ao-sys", version = "0.10", path = "./libspa-sys" }
+spa = { package = "libspa-ao", version = "0.10", path = "./libspa" }
 
 # External
 libc = "0.2"

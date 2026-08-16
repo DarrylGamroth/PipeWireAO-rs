@@ -1,29 +1,31 @@
-# pipewire-rs
+# PipeWireAO-rs
 
-### Rust bindings for pipewire and SPA libraries
+Rust bindings for the collision-free PipeWireAO and SPA libraries. This fork
+contains the exclusive latest-buffer and progressive-lease APIs used by the AO
+runtime. The published package identities are `pipewire-ao`,
+`pipewire-ao-sys`, `libspa-ao`, and `libspa-ao-sys`; they do not replace the
+upstream Rust packages.
 
-- Documentation
-    - [`pipewire`](https://pipewire.pages.freedesktop.org/pipewire-rs/pipewire/)
-    - [`libspa`](https://pipewire.pages.freedesktop.org/pipewire-rs/libspa/index.html)
-- [Examples](https://gitlab.freedesktop.org/pipewire/pipewire-rs/-/tree/main/pipewire/examples)
-- [How to contribute](https://gitlab.freedesktop.org/pipewire/pipewire-rs/-/blob/main/docs/CONTRIBUTING.md)
+The library targets retain the `pipewire`, `pipewire_sys`, `libspa`, and
+`libspa_sys` source names so an existing consumer can select the AO package
+explicitly without rewriting imports:
 
-### **These bindings are work-in-progress. Expect frequent breakage, bugs and missing features.**
+```toml
+pipewire = { package = "pipewire-ao", version = "0.10" }
+```
 
 ## Requirements
+
 - Rust 1.80 or newer
-- PipeWire 0.3 development files
+- PipeWireAO development files providing `libpipewire-ao-0.3` and
+  `libspa-ao-0.2` through pkg-config
 - Clang (see [bindgen requirements](https://rust-lang.github.io/rust-bindgen/requirements.html))
 
-## Getting help
-You can ask questions related to the rust bindings at [#pipewire-rs](irc://irc.oftc.net:6667/pipewire-rs), and general pipewire questions at [#pipewire](irc://irc.oftc.net:6667/pipewire) via IRC on [OFTC](https://www.oftc.net/).
-
-## Changelog
-
-Changes for releases are published on GitLab at:
-<https://gitlab.freedesktop.org/pipewire/pipewire-rs/-/releases>
+The build probes only the AO pkg-config names and intentionally fails when only
+upstream PipeWire is installed. For an uninstalled sibling PipeWireAO build,
+run Cargo through its Meson development environment.
 
 ## License
-The pipewire-rs project is distributed under the terms of the MIT license.
+PipeWireAO-rs is distributed under the terms of the MIT license.
 
 See [LICENSE](LICENSE) for more information.
