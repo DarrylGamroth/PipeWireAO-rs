@@ -49,13 +49,21 @@ impl std::fmt::Debug for DataType {
 bitflags::bitflags! {
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
     pub struct DataFlags: u32 {
-        /// Data is readable
-        const READABLE = 1<<0;
-        /// Data is writable
-        const WRITABLE = 1<<1;
-        /// Data pointer can be changed
-        const DYNAMIC = 1<<2;
+        /// Data is readable.
+        const READABLE = spa_sys::SPA_DATA_FLAG_READABLE;
+        /// Data is writable.
+        const WRITABLE = spa_sys::SPA_DATA_FLAG_WRITABLE;
+        /// Data pointer can be changed.
+        const DYNAMIC = spa_sys::SPA_DATA_FLAG_DYNAMIC;
         const READWRITE = Self::READABLE.bits() | Self::WRITABLE.bits();
+        /// Data can be mapped with a direct mmap/munmap pair.
+        const MAPPABLE = spa_sys::SPA_DATA_FLAG_MAPPABLE;
+        /// Storage is actually backed by huge pages.
+        const HUGE_PAGES = spa_sys::SPA_DATA_FLAG_HUGE_PAGES;
+        /// The actual huge-page size is 2 MiB.
+        const HUGE_2MB = spa_sys::SPA_DATA_FLAG_HUGE_2MB;
+        /// The actual huge-page size is 1 GiB.
+        const HUGE_1GB = spa_sys::SPA_DATA_FLAG_HUGE_1GB;
     }
 }
 
@@ -208,5 +216,12 @@ mod tests {
         chunk(&mut raw).set_flags(ChunkFlags::EMPTY);
 
         assert_eq!(chunk(&mut raw).flags(), ChunkFlags::EMPTY);
+    }
+
+    #[test]
+    fn data_flags_report_actual_huge_page_backing() {
+        assert_eq!(DataFlags::HUGE_PAGES.bits(), 1 << 4);
+        assert_eq!(DataFlags::HUGE_2MB.bits(), 1 << 5);
+        assert_eq!(DataFlags::HUGE_1GB.bits(), 1 << 6);
     }
 }

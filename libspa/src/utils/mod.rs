@@ -35,6 +35,9 @@ pub use spa_sys::spa_point as Point;
 pub use spa_sys::spa_rectangle as Rectangle;
 pub use spa_sys::spa_region as Region;
 
+/// Cache-line size selected by the PipeWireAO target ABI.
+pub const CACHE_LINE_SIZE: usize = spa_sys::SPA_CACHE_LINE_SIZE as usize;
+
 use crate::pod::CanonicalFixedSizedPod;
 
 /// An enumerated value in a pod
@@ -233,6 +236,11 @@ mod tests {
         );
         assert_eq!(format_pascal(""), "");
         assert_eq!(format_pascal(":::   "), "");
+    }
+
+    #[test]
+    fn cache_line_size_matches_generated_target_abi() {
+        assert_eq!(CACHE_LINE_SIZE, spa_sys::SPA_CACHE_LINE_SIZE as usize);
     }
 
     #[test]

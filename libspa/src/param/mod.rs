@@ -11,6 +11,55 @@ pub mod video;
 use std::ffi::CStr;
 use std::fmt::Debug;
 
+/// Properties of a `SPA_TYPE_OBJECT_ParamBuffers` object.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BufferProperties(pub spa_sys::spa_param_buffers);
+
+#[allow(non_upper_case_globals)]
+impl BufferProperties {
+    pub const Buffers: Self = Self(spa_sys::SPA_PARAM_BUFFERS_buffers);
+    pub const Blocks: Self = Self(spa_sys::SPA_PARAM_BUFFERS_blocks);
+    pub const Size: Self = Self(spa_sys::SPA_PARAM_BUFFERS_size);
+    pub const Stride: Self = Self(spa_sys::SPA_PARAM_BUFFERS_stride);
+    pub const Align: Self = Self(spa_sys::SPA_PARAM_BUFFERS_align);
+    pub const DataType: Self = Self(spa_sys::SPA_PARAM_BUFFERS_dataType);
+    pub const MetaType: Self = Self(spa_sys::SPA_PARAM_BUFFERS_metaType);
+    /// Best-effort backing page size (`Id` enum [`BufferPageSizeHint`]).
+    pub const PageSizeHint: Self = Self(spa_sys::SPA_PARAM_BUFFERS_pageSizeHint);
+
+    pub const fn from_raw(raw: spa_sys::spa_param_buffers) -> Self {
+        Self(raw)
+    }
+
+    pub const fn as_raw(self) -> spa_sys::spa_param_buffers {
+        self.0
+    }
+}
+
+/// Best-effort backing page size for host-allocated shared buffers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BufferPageSizeHint(pub spa_sys::spa_buffer_page_size_hint);
+
+#[allow(non_upper_case_globals)]
+impl BufferPageSizeHint {
+    /// Use ordinary system pages.
+    pub const Normal: Self = Self(spa_sys::SPA_BUFFER_PAGE_SIZE_NORMAL);
+    /// Try the system default hugetlb size, then ordinary pages.
+    pub const HugeDefault: Self = Self(spa_sys::SPA_BUFFER_PAGE_SIZE_HUGE_DEFAULT);
+    /// Try 2 MiB hugetlb pages, then ordinary pages.
+    pub const Huge2Mb: Self = Self(spa_sys::SPA_BUFFER_PAGE_SIZE_HUGE_2MB);
+    /// Try 1 GiB hugetlb pages, then ordinary pages.
+    pub const Huge1Gb: Self = Self(spa_sys::SPA_BUFFER_PAGE_SIZE_HUGE_1GB);
+
+    pub const fn from_raw(raw: spa_sys::spa_buffer_page_size_hint) -> Self {
+        Self(raw)
+    }
+
+    pub const fn as_raw(self) -> spa_sys::spa_buffer_page_size_hint {
+        self.0
+    }
+}
+
 /// Different parameter types that can be queried
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct ParamType(pub spa_sys::spa_param_type);
@@ -108,5 +157,19 @@ impl Debug for ParamInfo {
             .field("id", &self.id())
             .field("flags", &self.flags())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_page_size_hint_matches_native_abi() {
+        assert_eq!(BufferProperties::PageSizeHint.as_raw(), 8);
+        assert_eq!(BufferPageSizeHint::Normal.as_raw(), 0);
+        assert_eq!(BufferPageSizeHint::HugeDefault.as_raw(), 1);
+        assert_eq!(BufferPageSizeHint::Huge2Mb.as_raw(), 2);
+        assert_eq!(BufferPageSizeHint::Huge1Gb.as_raw(), 3);
     }
 }

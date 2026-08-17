@@ -179,16 +179,39 @@ pub struct ElementType(pub spa_sys::spa_element_type);
 #[allow(non_upper_case_globals)]
 impl ElementType {
     pub const Unknown: Self = Self(spa_sys::SPA_ELEMENT_TYPE_UNKNOWN);
+    /// Boolean byte; only zero and one are valid.
+    pub const Bool8: Self = Self(spa_sys::SPA_ELEMENT_TYPE_BOOL8);
+    pub const I8: Self = Self(spa_sys::SPA_ELEMENT_TYPE_I8);
+    pub const U8: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U8);
+    pub const I16Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_I16_LE);
+    pub const U16Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U16_LE);
+    pub const I32Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_I32_LE);
+    pub const U32Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U32_LE);
+    pub const I64Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_I64_LE);
+    pub const U64Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U64_LE);
+    pub const I128Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_I128_LE);
+    pub const U128Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U128_LE);
+    pub const F8E4M3Fn: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F8_E4M3FN);
+    pub const F8E4M3Fnuz: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F8_E4M3FNUZ);
+    pub const F8E5M2: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F8_E5M2);
+    pub const F8E5M2Fnuz: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F8_E5M2FNUZ);
     /// IEEE 754 binary16, little-endian.
     pub const F16Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F16_LE);
+    /// bfloat16, little-endian.
+    pub const Bf16Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_BF16_LE);
     /// IEEE 754 binary32, little-endian.
     pub const F32Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F32_LE);
     /// IEEE 754 binary64, little-endian.
     pub const F64Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F64_LE);
-    /// Unsigned 8-bit integer.
-    pub const U8: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U8);
-    /// Unsigned 32-bit integer, little-endian.
-    pub const U32Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U32_LE);
+    /// IEEE 754 binary128, little-endian.
+    pub const F128Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F128_LE);
+    pub const ComplexF16Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_COMPLEX_F16_LE);
+    pub const ComplexBf16Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_COMPLEX_BF16_LE);
+    pub const ComplexF32Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_COMPLEX_F32_LE);
+    pub const ComplexF64Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_COMPLEX_F64_LE);
+    pub const ComplexF128Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_COMPLEX_F128_LE);
+    /// First application-defined fixed-width scalar type ID.
+    pub const StartCustom: Self = Self(spa_sys::SPA_ELEMENT_TYPE_START_CUSTOM);
 
     /// Obtain an [`ElementType`] from a raw `spa_element_type` variant.
     pub const fn from_raw(raw: spa_sys::spa_element_type) -> Self {
@@ -203,10 +226,20 @@ impl ElementType {
     /// Packed size of one element, or `None` for an unsupported value.
     pub const fn size(self) -> Option<usize> {
         match self {
-            Self::F16Le => Some(2),
-            Self::F32Le | Self::U32Le => Some(4),
-            Self::F64Le => Some(8),
-            Self::U8 => Some(1),
+            Self::Bool8
+            | Self::I8
+            | Self::U8
+            | Self::F8E4M3Fn
+            | Self::F8E4M3Fnuz
+            | Self::F8E5M2
+            | Self::F8E5M2Fnuz => Some(1),
+            Self::I16Le | Self::U16Le | Self::F16Le | Self::Bf16Le => Some(2),
+            Self::I32Le | Self::U32Le | Self::F32Le | Self::ComplexF16Le | Self::ComplexBf16Le => {
+                Some(4)
+            }
+            Self::I64Le | Self::U64Le | Self::F64Le | Self::ComplexF32Le => Some(8),
+            Self::I128Le | Self::U128Le | Self::F128Le | Self::ComplexF64Le => Some(16),
+            Self::ComplexF128Le => Some(32),
             _ => None,
         }
     }
@@ -216,11 +249,32 @@ impl Debug for ElementType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match *self {
             Self::Unknown => "ElementType::Unknown",
+            Self::Bool8 => "ElementType::Bool8",
+            Self::I8 => "ElementType::I8",
+            Self::U8 => "ElementType::U8",
+            Self::I16Le => "ElementType::I16Le",
+            Self::U16Le => "ElementType::U16Le",
+            Self::I32Le => "ElementType::I32Le",
+            Self::U32Le => "ElementType::U32Le",
+            Self::I64Le => "ElementType::I64Le",
+            Self::U64Le => "ElementType::U64Le",
+            Self::I128Le => "ElementType::I128Le",
+            Self::U128Le => "ElementType::U128Le",
+            Self::F8E4M3Fn => "ElementType::F8E4M3Fn",
+            Self::F8E4M3Fnuz => "ElementType::F8E4M3Fnuz",
+            Self::F8E5M2 => "ElementType::F8E5M2",
+            Self::F8E5M2Fnuz => "ElementType::F8E5M2Fnuz",
             Self::F16Le => "ElementType::F16Le",
+            Self::Bf16Le => "ElementType::Bf16Le",
             Self::F32Le => "ElementType::F32Le",
             Self::F64Le => "ElementType::F64Le",
-            Self::U8 => "ElementType::U8",
-            Self::U32Le => "ElementType::U32Le",
+            Self::F128Le => "ElementType::F128Le",
+            Self::ComplexF16Le => "ElementType::ComplexF16Le",
+            Self::ComplexBf16Le => "ElementType::ComplexBf16Le",
+            Self::ComplexF32Le => "ElementType::ComplexF32Le",
+            Self::ComplexF64Le => "ElementType::ComplexF64Le",
+            Self::ComplexF128Le => "ElementType::ComplexF128Le",
+            Self::StartCustom => "ElementType::StartCustom",
             Self(raw) => return f.debug_tuple("ElementType").field(&raw).finish(),
         })
     }
@@ -806,6 +860,43 @@ mod tests {
             MatrixFormat::new(ElementType::F32Le, 48, 64, NdArrayLayout::Unknown, None),
             Err(NdArrayFormatError::UnsupportedLayout)
         );
+    }
+
+    #[test]
+    fn ndarray_element_types_cover_native_scalar_vocabulary() {
+        let expected = [
+            (ElementType::Bool8, 1),
+            (ElementType::I8, 1),
+            (ElementType::U8, 1),
+            (ElementType::I16Le, 2),
+            (ElementType::U16Le, 2),
+            (ElementType::I32Le, 4),
+            (ElementType::U32Le, 4),
+            (ElementType::I64Le, 8),
+            (ElementType::U64Le, 8),
+            (ElementType::I128Le, 16),
+            (ElementType::U128Le, 16),
+            (ElementType::F8E4M3Fn, 1),
+            (ElementType::F8E4M3Fnuz, 1),
+            (ElementType::F8E5M2, 1),
+            (ElementType::F8E5M2Fnuz, 1),
+            (ElementType::F16Le, 2),
+            (ElementType::Bf16Le, 2),
+            (ElementType::F32Le, 4),
+            (ElementType::F64Le, 8),
+            (ElementType::F128Le, 16),
+            (ElementType::ComplexF16Le, 4),
+            (ElementType::ComplexBf16Le, 4),
+            (ElementType::ComplexF32Le, 8),
+            (ElementType::ComplexF64Le, 16),
+            (ElementType::ComplexF128Le, 32),
+        ];
+
+        for (element_type, size) in expected {
+            assert_eq!(element_type.size(), Some(size));
+        }
+        assert_eq!(ElementType::Unknown.size(), None);
+        assert_eq!(ElementType::StartCustom.size(), None);
     }
 
     #[test]
