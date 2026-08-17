@@ -7,7 +7,10 @@ use std::ffi::CStr;
 use std::fmt::Debug;
 use std::ops::Range;
 
-use crate::utils::fmt_pascal_case;
+use crate::{
+    pod::{Property, Value, ValueArray},
+    utils::{fmt_pascal_case, Fraction, Id},
+};
 
 /// Different media types
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -105,6 +108,8 @@ impl MediaSubtype {
 
     /// control stream, data contains spa_pod_sequence with control info.
     pub const Control: Self = Self(spa_sys::SPA_MEDIA_SUBTYPE_control);
+    /// Packed N-dimensional typed elements.
+    pub const NdArray: Self = Self(spa_sys::SPA_MEDIA_SUBTYPE_ndarray);
 
     const AUDIO_RANGE: Range<Self> = Self::Mp3..Self(spa_sys::SPA_MEDIA_SUBTYPE_START_Video);
     const VIDEO_RANGE: Range<Self> = Self::H264..Self(spa_sys::SPA_MEDIA_SUBTYPE_START_Image);
@@ -164,6 +169,424 @@ impl Debug for MediaSubtype {
         };
         f.write_str("MediaSubtype::")?;
         fmt_pascal_case(f, &c_str.to_string_lossy())
+    }
+}
+
+/// Scalar representation of an [`NdArrayFormat`] element.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub struct ElementType(pub spa_sys::spa_element_type);
+
+#[allow(non_upper_case_globals)]
+impl ElementType {
+    pub const Unknown: Self = Self(spa_sys::SPA_ELEMENT_TYPE_UNKNOWN);
+    /// IEEE 754 binary16, little-endian.
+    pub const F16Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F16_LE);
+    /// IEEE 754 binary32, little-endian.
+    pub const F32Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F32_LE);
+    /// IEEE 754 binary64, little-endian.
+    pub const F64Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_F64_LE);
+    /// Unsigned 8-bit integer.
+    pub const U8: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U8);
+    /// Unsigned 32-bit integer, little-endian.
+    pub const U32Le: Self = Self(spa_sys::SPA_ELEMENT_TYPE_U32_LE);
+
+    /// Obtain an [`ElementType`] from a raw `spa_element_type` variant.
+    pub const fn from_raw(raw: spa_sys::spa_element_type) -> Self {
+        Self(raw)
+    }
+
+    /// Get the raw `spa_element_type` value.
+    pub const fn as_raw(self) -> spa_sys::spa_element_type {
+        self.0
+    }
+
+    /// Packed size of one element, or `None` for an unsupported value.
+    pub const fn size(self) -> Option<usize> {
+        match self {
+            Self::F16Le => Some(2),
+            Self::F32Le | Self::U32Le => Some(4),
+            Self::F64Le => Some(8),
+            Self::U8 => Some(1),
+            _ => None,
+        }
+    }
+}
+
+impl Debug for ElementType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match *self {
+            Self::Unknown => "ElementType::Unknown",
+            Self::F16Le => "ElementType::F16Le",
+            Self::F32Le => "ElementType::F32Le",
+            Self::F64Le => "ElementType::F64Le",
+            Self::U8 => "ElementType::U8",
+            Self::U32Le => "ElementType::U32Le",
+            Self(raw) => return f.debug_tuple("ElementType").field(&raw).finish(),
+        })
+    }
+}
+
+/// Contiguous storage order of an [`NdArrayFormat`].
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub struct NdArrayLayout(pub spa_sys::spa_ndarray_layout);
+
+#[allow(non_upper_case_globals)]
+impl NdArrayLayout {
+    pub const Unknown: Self = Self(spa_sys::SPA_NDARRAY_LAYOUT_UNKNOWN);
+    /// The last logical axis is contiguous.
+    pub const RowMajor: Self = Self(spa_sys::SPA_NDARRAY_LAYOUT_ROW_MAJOR);
+    /// The first logical axis is contiguous.
+    pub const ColumnMajor: Self = Self(spa_sys::SPA_NDARRAY_LAYOUT_COLUMN_MAJOR);
+
+    /// Obtain an [`NdArrayLayout`] from a raw `spa_ndarray_layout` variant.
+    pub const fn from_raw(raw: spa_sys::spa_ndarray_layout) -> Self {
+        Self(raw)
+    }
+
+    /// Get the raw `spa_ndarray_layout` value.
+    pub const fn as_raw(self) -> spa_sys::spa_ndarray_layout {
+        self.0
+    }
+}
+
+impl Debug for NdArrayLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match *self {
+            Self::Unknown => "NdArrayLayout::Unknown",
+            Self::RowMajor => "NdArrayLayout::RowMajor",
+            Self::ColumnMajor => "NdArrayLayout::ColumnMajor",
+            Self(raw) => return f.debug_tuple("NdArrayLayout").field(&raw).finish(),
+        })
+    }
+}
+
+/// Invalid native ndarray, vector, or matrix format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NdArrayFormatError {
+    UnsupportedElementType,
+    UnsupportedLayout,
+    EmptyShape,
+    ZeroDimension { axis: usize },
+    DimensionTooLarge { axis: usize },
+    ElementCountOverflow,
+    ByteCountOverflow,
+    InvalidRate,
+    MissingProperty(FormatProperties),
+    DuplicateProperty(FormatProperties),
+    InvalidProperty(FormatProperties),
+    WrongRank { expected: usize, actual: usize },
+    NonCanonicalVectorLayout,
+}
+
+impl std::fmt::Display for NdArrayFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::UnsupportedElementType => f.write_str("unsupported ndarray element type"),
+            Self::UnsupportedLayout => f.write_str("unsupported ndarray layout"),
+            Self::EmptyShape => f.write_str("ndarray shape must contain at least one dimension"),
+            Self::ZeroDimension { axis } => write!(f, "ndarray dimension {axis} is zero"),
+            Self::DimensionTooLarge { axis } => {
+                write!(f, "ndarray dimension {axis} does not fit a SPA Int")
+            }
+            Self::ElementCountOverflow => f.write_str("ndarray element count overflows usize"),
+            Self::ByteCountOverflow => f.write_str("ndarray byte count overflows usize"),
+            Self::InvalidRate => f.write_str("ndarray rate must be a positive fraction"),
+            Self::MissingProperty(property) => {
+                write!(f, "missing required ndarray property {property:?}")
+            }
+            Self::DuplicateProperty(property) => {
+                write!(f, "duplicate ndarray property {property:?}")
+            }
+            Self::InvalidProperty(property) => {
+                write!(f, "invalid ndarray property {property:?}")
+            }
+            Self::WrongRank { expected, actual } => {
+                write!(f, "expected ndarray rank {expected}, got {actual}")
+            }
+            Self::NonCanonicalVectorLayout => {
+                f.write_str("rank-one vectors must use the canonical row-major layout")
+            }
+        }
+    }
+}
+
+fn property_value(
+    properties: &[Property],
+    key: FormatProperties,
+    required: bool,
+) -> Result<Option<&Value>, NdArrayFormatError> {
+    let mut matching = properties
+        .iter()
+        .filter(|property| property.key == key.as_raw());
+    let value = matching.next().map(|property| &property.value);
+    if matching.next().is_some() {
+        return Err(NdArrayFormatError::DuplicateProperty(key));
+    }
+    if required && value.is_none() {
+        return Err(NdArrayFormatError::MissingProperty(key));
+    }
+    Ok(value)
+}
+
+impl NdArrayFormat<Vec<u32>> {
+    /// Parse a fixed native ndarray format while ignoring application properties.
+    pub fn from_properties(properties: &[Property]) -> Result<Self, NdArrayFormatError> {
+        let media_type = property_value(properties, FormatProperties::MediaType, true)?;
+        if media_type != Some(&Value::Id(Id(MediaType::Application.as_raw()))) {
+            return Err(NdArrayFormatError::InvalidProperty(
+                FormatProperties::MediaType,
+            ));
+        }
+        let media_subtype = property_value(properties, FormatProperties::MediaSubtype, true)?;
+        if media_subtype != Some(&Value::Id(Id(MediaSubtype::NdArray.as_raw()))) {
+            return Err(NdArrayFormatError::InvalidProperty(
+                FormatProperties::MediaSubtype,
+            ));
+        }
+
+        let element_type =
+            match property_value(properties, FormatProperties::NdArrayElementType, true)? {
+                Some(Value::Id(Id(raw))) => ElementType::from_raw(*raw),
+                _ => {
+                    return Err(NdArrayFormatError::InvalidProperty(
+                        FormatProperties::NdArrayElementType,
+                    ));
+                }
+            };
+        let shape = match property_value(properties, FormatProperties::NdArrayShape, true)? {
+            Some(Value::ValueArray(ValueArray::Int(shape))) => shape
+                .iter()
+                .map(|&dimension| {
+                    u32::try_from(dimension).map_err(|_| {
+                        NdArrayFormatError::InvalidProperty(FormatProperties::NdArrayShape)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(NdArrayFormatError::InvalidProperty(
+                    FormatProperties::NdArrayShape,
+                ));
+            }
+        };
+        let layout = match property_value(properties, FormatProperties::NdArrayLayout, true)? {
+            Some(Value::Id(Id(raw))) => NdArrayLayout::from_raw(*raw),
+            _ => {
+                return Err(NdArrayFormatError::InvalidProperty(
+                    FormatProperties::NdArrayLayout,
+                ));
+            }
+        };
+        let rate = match property_value(properties, FormatProperties::NdArrayRate, false)? {
+            Some(Value::Fraction(rate)) => Some(*rate),
+            Some(_) => {
+                return Err(NdArrayFormatError::InvalidProperty(
+                    FormatProperties::NdArrayRate,
+                ));
+            }
+            None => None,
+        };
+        Self::new(element_type, shape, layout, rate)
+    }
+}
+
+impl std::error::Error for NdArrayFormatError {}
+
+/// Native packed ndarray format with a caller-selected shape container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NdArrayFormat<S> {
+    element_type: ElementType,
+    shape: S,
+    layout: NdArrayLayout,
+    rate: Option<Fraction>,
+}
+
+impl<S: AsRef<[u32]>> NdArrayFormat<S> {
+    pub fn new(
+        element_type: ElementType,
+        shape: S,
+        layout: NdArrayLayout,
+        rate: Option<Fraction>,
+    ) -> Result<Self, NdArrayFormatError> {
+        let element_size = element_type
+            .size()
+            .ok_or(NdArrayFormatError::UnsupportedElementType)?;
+        if layout != NdArrayLayout::RowMajor && layout != NdArrayLayout::ColumnMajor {
+            return Err(NdArrayFormatError::UnsupportedLayout);
+        }
+        if rate.is_some_and(|rate| rate.num == 0 || rate.denom == 0) {
+            return Err(NdArrayFormatError::InvalidRate);
+        }
+
+        let dimensions = shape.as_ref();
+        if dimensions.is_empty() {
+            return Err(NdArrayFormatError::EmptyShape);
+        }
+        let mut element_count = 1usize;
+        for (axis, &dimension) in dimensions.iter().enumerate() {
+            if dimension == 0 {
+                return Err(NdArrayFormatError::ZeroDimension { axis });
+            }
+            if dimension > i32::MAX as u32 {
+                return Err(NdArrayFormatError::DimensionTooLarge { axis });
+            }
+            element_count = element_count
+                .checked_mul(dimension as usize)
+                .ok_or(NdArrayFormatError::ElementCountOverflow)?;
+        }
+        element_count
+            .checked_mul(element_size)
+            .ok_or(NdArrayFormatError::ByteCountOverflow)?;
+
+        Ok(Self {
+            element_type,
+            shape,
+            layout,
+            rate,
+        })
+    }
+
+    pub fn element_type(&self) -> ElementType {
+        self.element_type
+    }
+
+    pub fn shape(&self) -> &[u32] {
+        self.shape.as_ref()
+    }
+
+    pub fn layout(&self) -> NdArrayLayout {
+        self.layout
+    }
+
+    pub fn rate(&self) -> Option<Fraction> {
+        self.rate
+    }
+
+    pub fn element_count(&self) -> usize {
+        self.shape()
+            .iter()
+            .fold(1usize, |count, &dimension| count * dimension as usize)
+    }
+
+    pub fn byte_count(&self) -> usize {
+        self.element_count() * self.element_type.size().expect("validated element type")
+    }
+
+    /// Build the native SPA properties for this format.
+    ///
+    /// Application-specific semantic properties can be appended to the result.
+    pub fn properties(&self) -> Vec<Property> {
+        let mut properties = Vec::with_capacity(if self.rate.is_some() { 6 } else { 5 });
+        properties.push(Property::new(
+            FormatProperties::MediaType.as_raw(),
+            Value::Id(Id(MediaType::Application.as_raw())),
+        ));
+        properties.push(Property::new(
+            FormatProperties::MediaSubtype.as_raw(),
+            Value::Id(Id(MediaSubtype::NdArray.as_raw())),
+        ));
+        properties.push(Property::new(
+            FormatProperties::NdArrayElementType.as_raw(),
+            Value::Id(Id(self.element_type.as_raw())),
+        ));
+        properties.push(Property::new(
+            FormatProperties::NdArrayShape.as_raw(),
+            Value::ValueArray(ValueArray::Int(
+                self.shape()
+                    .iter()
+                    .map(|&dimension| dimension as i32)
+                    .collect(),
+            )),
+        ));
+        properties.push(Property::new(
+            FormatProperties::NdArrayLayout.as_raw(),
+            Value::Id(Id(self.layout.as_raw())),
+        ));
+        if let Some(rate) = self.rate {
+            properties.push(Property::new(
+                FormatProperties::NdArrayRate.as_raw(),
+                Value::Fraction(rate),
+            ));
+        }
+        properties
+    }
+}
+
+/// Canonical rank-one ndarray format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorFormat(NdArrayFormat<[u32; 1]>);
+
+impl VectorFormat {
+    pub fn new(
+        element_type: ElementType,
+        length: u32,
+        rate: Option<Fraction>,
+    ) -> Result<Self, NdArrayFormatError> {
+        NdArrayFormat::new(element_type, [length], NdArrayLayout::RowMajor, rate).map(Self)
+    }
+
+    pub fn as_ndarray(&self) -> &NdArrayFormat<[u32; 1]> {
+        &self.0
+    }
+
+    pub fn properties(&self) -> Vec<Property> {
+        self.0.properties()
+    }
+
+    /// Parse a fixed native rank-one format.
+    pub fn from_properties(properties: &[Property]) -> Result<Self, NdArrayFormatError> {
+        let format = NdArrayFormat::<Vec<u32>>::from_properties(properties)?;
+        let [length] = format.shape() else {
+            return Err(NdArrayFormatError::WrongRank {
+                expected: 1,
+                actual: format.shape().len(),
+            });
+        };
+        if format.layout() != NdArrayLayout::RowMajor {
+            return Err(NdArrayFormatError::NonCanonicalVectorLayout);
+        }
+        Self::new(format.element_type(), *length, format.rate())
+    }
+}
+
+/// Rank-two ndarray format with explicit row-major or column-major storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixFormat(NdArrayFormat<[u32; 2]>);
+
+impl MatrixFormat {
+    pub fn new(
+        element_type: ElementType,
+        rows: u32,
+        columns: u32,
+        layout: NdArrayLayout,
+        rate: Option<Fraction>,
+    ) -> Result<Self, NdArrayFormatError> {
+        NdArrayFormat::new(element_type, [rows, columns], layout, rate).map(Self)
+    }
+
+    pub fn as_ndarray(&self) -> &NdArrayFormat<[u32; 2]> {
+        &self.0
+    }
+
+    pub fn properties(&self) -> Vec<Property> {
+        self.0.properties()
+    }
+
+    /// Parse a fixed native rank-two format in either contiguous storage order.
+    pub fn from_properties(properties: &[Property]) -> Result<Self, NdArrayFormatError> {
+        let format = NdArrayFormat::<Vec<u32>>::from_properties(properties)?;
+        let [rows, columns] = format.shape() else {
+            return Err(NdArrayFormatError::WrongRank {
+                expected: 2,
+                actual: format.shape().len(),
+            });
+        };
+        Self::new(
+            format.element_type(),
+            *rows,
+            *columns,
+            format.layout(),
+            format.rate(),
+        )
     }
 }
 
@@ -253,6 +676,15 @@ impl FormatProperties {
     /// (Id enum spa_h264_alignment)
     pub const VideoH264Alignment: Self = Self(spa_sys::SPA_FORMAT_VIDEO_H264_alignment);
 
+    /// ndarray element type (Id enum spa_element_type)
+    pub const NdArrayElementType: Self = Self(spa_sys::SPA_FORMAT_NDARRAY_elementType);
+    /// positive logical dimensions (Array of Int)
+    pub const NdArrayShape: Self = Self(spa_sys::SPA_FORMAT_NDARRAY_shape);
+    /// contiguous storage order (Id enum spa_ndarray_layout)
+    pub const NdArrayLayout: Self = Self(spa_sys::SPA_FORMAT_NDARRAY_layout);
+    /// optional sample rate (Fraction)
+    pub const NdArrayRate: Self = Self(spa_sys::SPA_FORMAT_NDARRAY_rate);
+
     const AUDIO_RANGE: Range<Self> = Self::AudioFormat..Self(spa_sys::SPA_FORMAT_START_Video);
     const VIDEO_RANGE: Range<Self> = Self::VideoFormat..Self(spa_sys::SPA_FORMAT_START_Image);
     const IMAGE_RANGE: Range<Self> =
@@ -327,8 +759,122 @@ mod tests {
         assert_eq!("MediaType::Audio", format!("{:?}", MediaType::Audio));
         assert_eq!("MediaSubtype::Raw", format!("{:?}", MediaSubtype::Raw));
         assert_eq!(
+            "MediaSubtype::Ndarray",
+            format!("{:?}", MediaSubtype::NdArray)
+        );
+        assert_eq!(
             "FormatProperties::VideoTransferFunction",
             format!("{:?}", FormatProperties::VideoTransferFunction)
+        );
+        assert_eq!(
+            "FormatProperties::NdArrayElementType",
+            format!("{:?}", FormatProperties::NdArrayElementType)
+        );
+    }
+
+    #[test]
+    fn ndarray_profiles_validate_shape_layout_and_size() {
+        let vector = VectorFormat::new(
+            ElementType::F32Le,
+            2048,
+            Some(Fraction {
+                num: 1000,
+                denom: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(vector.as_ndarray().shape(), &[2048]);
+        assert_eq!(vector.as_ndarray().layout(), NdArrayLayout::RowMajor);
+        assert_eq!(vector.as_ndarray().byte_count(), 8192);
+
+        let matrix =
+            MatrixFormat::new(ElementType::F64Le, 48, 64, NdArrayLayout::ColumnMajor, None)
+                .unwrap();
+        assert_eq!(matrix.as_ndarray().shape(), &[48, 64]);
+        assert_eq!(matrix.as_ndarray().layout(), NdArrayLayout::ColumnMajor);
+        assert_eq!(matrix.as_ndarray().byte_count(), 48 * 64 * 8);
+
+        assert_eq!(
+            VectorFormat::new(ElementType::F32Le, 0, None),
+            Err(NdArrayFormatError::ZeroDimension { axis: 0 })
+        );
+        assert_eq!(
+            MatrixFormat::new(ElementType::Unknown, 48, 64, NdArrayLayout::RowMajor, None),
+            Err(NdArrayFormatError::UnsupportedElementType)
+        );
+        assert_eq!(
+            MatrixFormat::new(ElementType::F32Le, 48, 64, NdArrayLayout::Unknown, None),
+            Err(NdArrayFormatError::UnsupportedLayout)
+        );
+    }
+
+    #[test]
+    fn ndarray_properties_use_native_shape_and_layout_ids() {
+        let matrix =
+            MatrixFormat::new(ElementType::F32Le, 3, 5, NdArrayLayout::ColumnMajor, None).unwrap();
+        let properties = matrix.properties();
+
+        assert_eq!(properties.len(), 5);
+        assert_eq!(
+            properties[1],
+            Property::new(
+                FormatProperties::MediaSubtype.as_raw(),
+                Value::Id(Id(MediaSubtype::NdArray.as_raw()))
+            )
+        );
+        assert_eq!(
+            properties[3],
+            Property::new(
+                FormatProperties::NdArrayShape.as_raw(),
+                Value::ValueArray(ValueArray::Int(vec![3, 5]))
+            )
+        );
+        assert_eq!(
+            properties[4],
+            Property::new(
+                FormatProperties::NdArrayLayout.as_raw(),
+                Value::Id(Id(NdArrayLayout::ColumnMajor.as_raw()))
+            )
+        );
+        assert_eq!(MatrixFormat::from_properties(&properties).unwrap(), matrix);
+        assert_eq!(
+            VectorFormat::from_properties(&properties),
+            Err(NdArrayFormatError::WrongRank {
+                expected: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn ndarray_property_parser_rejects_missing_duplicate_and_noncanonical_values() {
+        let vector = VectorFormat::new(ElementType::F32Le, 8, None).unwrap();
+        let mut properties = vector.properties();
+        properties.retain(|property| property.key != FormatProperties::NdArrayShape.as_raw());
+        assert_eq!(
+            VectorFormat::from_properties(&properties),
+            Err(NdArrayFormatError::MissingProperty(
+                FormatProperties::NdArrayShape
+            ))
+        );
+
+        let mut properties = vector.properties();
+        properties.push(properties[3].clone());
+        assert_eq!(
+            VectorFormat::from_properties(&properties),
+            Err(NdArrayFormatError::DuplicateProperty(
+                FormatProperties::NdArrayShape
+            ))
+        );
+
+        let mut properties = vector.properties();
+        properties[4] = Property::new(
+            FormatProperties::NdArrayLayout.as_raw(),
+            Value::Id(Id(NdArrayLayout::ColumnMajor.as_raw())),
+        );
+        assert_eq!(
+            VectorFormat::from_properties(&properties),
+            Err(NdArrayFormatError::NonCanonicalVectorLayout)
         );
     }
 }

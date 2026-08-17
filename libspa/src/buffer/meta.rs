@@ -598,3 +598,321 @@ impl Debug for MetaSyncTimeline {
 impl Metadata for MetaSyncTimeline {
     const META_TYPE: u32 = spa_sys::SPA_META_SyncTimeline;
 }
+
+bitflags::bitflags! {
+    /// Terminal outcome flags for [`MetaProgressive`].
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    pub struct ProgressiveFlags: u32 {
+        const INCOMPLETE = spa_sys::SPA_META_PROGRESSIVE_FLAG_INCOMPLETE;
+        const INVALID_LAYOUT = spa_sys::SPA_META_PROGRESSIVE_FLAG_INVALID_LAYOUT;
+        const CANCELLED = spa_sys::SPA_META_PROGRESSIVE_FLAG_CANCELLED;
+        const DEVICE_ERROR = spa_sys::SPA_META_PROGRESSIVE_FLAG_DEVICE_ERROR;
+        const CORRUPTED = spa_sys::SPA_META_PROGRESSIVE_FLAG_CORRUPTED;
+        const PROTOCOL_ERROR = spa_sys::SPA_META_PROGRESSIVE_FLAG_PROTOCOL_ERROR;
+    }
+}
+
+/// Producer lifecycle state published in one atomic progressive snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ProgressiveState {
+    Prepared = spa_sys::SPA_META_PROGRESSIVE_STATE_PREPARED,
+    Active = spa_sys::SPA_META_PROGRESSIVE_STATE_ACTIVE,
+    Complete = spa_sys::SPA_META_PROGRESSIVE_STATE_COMPLETE,
+    Aborted = spa_sys::SPA_META_PROGRESSIVE_STATE_ABORTED,
+}
+
+/// One coherent view of committed bytes and producer state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressiveSnapshot {
+    committed_bytes: u32,
+    state: ProgressiveState,
+}
+
+impl ProgressiveSnapshot {
+    pub const fn new(committed_bytes: u32, state: ProgressiveState) -> Self {
+        Self {
+            committed_bytes,
+            state,
+        }
+    }
+
+    pub const fn committed_bytes(self) -> u32 {
+        self.committed_bytes
+    }
+
+    pub const fn state(self) -> ProgressiveState {
+        self.state
+    }
+
+    pub const fn encode(self) -> u64 {
+        self.committed_bytes as u64
+            | ((self.state as u64) << spa_sys::SPA_META_PROGRESSIVE_STATE_SHIFT)
+    }
+
+    pub const fn decode(value: u64) -> Option<Self> {
+        if value & spa_sys::SPA_META_PROGRESSIVE_RESERVED_MASK as u64 != 0 {
+            return None;
+        }
+        let state = match ((value & spa_sys::SPA_META_PROGRESSIVE_STATE_MASK)
+            >> spa_sys::SPA_META_PROGRESSIVE_STATE_SHIFT) as u32
+        {
+            spa_sys::SPA_META_PROGRESSIVE_STATE_PREPARED => ProgressiveState::Prepared,
+            spa_sys::SPA_META_PROGRESSIVE_STATE_ACTIVE => ProgressiveState::Active,
+            spa_sys::SPA_META_PROGRESSIVE_STATE_COMPLETE => ProgressiveState::Complete,
+            spa_sys::SPA_META_PROGRESSIVE_STATE_ABORTED => ProgressiveState::Aborted,
+            _ => return None,
+        };
+        Some(Self::new(
+            (value & spa_sys::SPA_META_PROGRESSIVE_COMMITTED_MASK as u64) as u32,
+            state,
+        ))
+    }
+}
+
+/// Acquire-observed progressive state and terminal flags when quiescent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressiveObservation {
+    snapshot: ProgressiveSnapshot,
+    terminal_flags: Option<ProgressiveFlags>,
+}
+
+impl ProgressiveObservation {
+    pub const fn snapshot(self) -> ProgressiveSnapshot {
+        self.snapshot
+    }
+
+    pub const fn terminal_flags(self) -> Option<ProgressiveFlags> {
+        self.terminal_flags
+    }
+}
+
+/// A mapped progressive metadata allocation violates the native Version 1 ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressiveMetaError;
+
+impl std::fmt::Display for ProgressiveMetaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid PipeWireAO progressive metadata")
+    }
+}
+
+impl std::error::Error for ProgressiveMetaError {}
+
+/// Version 1 progressive-buffer metadata shared by PipeWireAO endpoints.
+#[repr(transparent)]
+pub struct MetaProgressive(spa_sys::spa_meta_progressive);
+
+impl MetaProgressive {
+    pub fn new(
+        data_index: u32,
+        payload_offset: u32,
+        payload_size: u32,
+        commit_granularity: u32,
+    ) -> Result<Self, ProgressiveMetaError> {
+        let mut meta = Self(spa_sys::spa_meta_progressive {
+            version: 0,
+            abi_size: 0,
+            data_index: 0,
+            payload_offset: 0,
+            payload_size: 0,
+            commit_granularity: 0,
+            terminal_flags: 0,
+            reserved0: 0,
+            snapshot: 0,
+            reserved1: 0,
+        });
+        meta.initialize(data_index, payload_offset, payload_size, commit_granularity)?;
+        Ok(meta)
+    }
+
+    pub fn initialize(
+        &mut self,
+        data_index: u32,
+        payload_offset: u32,
+        payload_size: u32,
+        commit_granularity: u32,
+    ) -> Result<(), ProgressiveMetaError> {
+        let valid = unsafe {
+            spa_sys::spa_meta_progressive_init(
+                self.as_raw_mut(),
+                data_index,
+                payload_offset,
+                payload_size,
+                commit_granularity,
+            )
+        };
+        valid.then_some(()).ok_or(ProgressiveMetaError)
+    }
+
+    pub fn as_raw(&self) -> &spa_sys::spa_meta_progressive {
+        &self.0
+    }
+
+    pub fn as_raw_mut(&mut self) -> &mut spa_sys::spa_meta_progressive {
+        &mut self.0
+    }
+
+    pub fn version(&self) -> u32 {
+        self.0.version
+    }
+
+    pub fn abi_size(&self) -> u32 {
+        self.0.abi_size
+    }
+
+    pub fn data_index(&self) -> u32 {
+        self.0.data_index
+    }
+
+    pub fn payload_offset(&self) -> u32 {
+        self.0.payload_offset
+    }
+
+    pub fn payload_size(&self) -> u32 {
+        self.0.payload_size
+    }
+
+    pub fn commit_granularity(&self) -> u32 {
+        self.0.commit_granularity
+    }
+
+    pub fn set_terminal_flags(&mut self, flags: ProgressiveFlags) {
+        self.0.terminal_flags = flags.bits();
+    }
+
+    fn snapshot_atomic(&self) -> &std::sync::atomic::AtomicU64 {
+        unsafe {
+            // SAFETY: the native ABI fixes `snapshot` at an 8-byte aligned
+            // offset and requires all accesses to use atomic operations.
+            &*std::ptr::addr_of!(self.0.snapshot).cast()
+        }
+    }
+
+    /// Acquire-load the authoritative committed prefix and producer state.
+    pub fn load_acquire(&self) -> Result<ProgressiveSnapshot, ProgressiveMetaError> {
+        let value = self
+            .snapshot_atomic()
+            .load(std::sync::atomic::Ordering::Acquire);
+        ProgressiveSnapshot::decode(value).ok_or(ProgressiveMetaError)
+    }
+
+    /// Acquire-load state and read terminal flags only after producer quiescence.
+    pub fn observe_acquire(&self) -> Result<ProgressiveObservation, ProgressiveMetaError> {
+        let snapshot = self.load_acquire()?;
+        let terminal_flags = match snapshot.state() {
+            ProgressiveState::Complete | ProgressiveState::Aborted => Some(
+                ProgressiveFlags::from_bits(self.0.terminal_flags).ok_or(ProgressiveMetaError)?,
+            ),
+            ProgressiveState::Prepared | ProgressiveState::Active => None,
+        };
+        Ok(ProgressiveObservation {
+            snapshot,
+            terminal_flags,
+        })
+    }
+
+    /// Release-publish a committed prefix and producer state.
+    pub fn store_release(&self, snapshot: ProgressiveSnapshot) {
+        self.snapshot_atomic()
+            .store(snapshot.encode(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Validate immutable Version 1 fields and the current atomic observation.
+    pub fn validate(&self) -> Result<(), ProgressiveMetaError> {
+        let observation = self.observe_acquire()?;
+        if self.0.version != spa_sys::SPA_META_PROGRESSIVE_VERSION
+            || self.0.abi_size != spa_sys::SPA_META_PROGRESSIVE_SIZE
+            || self.0.reserved0 != 0
+            || self.0.reserved1 != 0
+            || self.0.payload_size == 0
+            || self.0.commit_granularity == 0
+            || self.0.commit_granularity > self.0.payload_size
+            || observation.snapshot().committed_bytes() > self.0.payload_size
+        {
+            return Err(ProgressiveMetaError);
+        }
+        Ok(())
+    }
+}
+
+impl Debug for MetaProgressive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let observation = self.observe_acquire();
+        f.debug_struct("MetaProgressive")
+            .field("version", &self.version())
+            .field("abi_size", &self.abi_size())
+            .field("data_index", &self.data_index())
+            .field("payload_offset", &self.payload_offset())
+            .field("payload_size", &self.payload_size())
+            .field("commit_granularity", &self.commit_granularity())
+            .field("observation", &observation)
+            .finish()
+    }
+}
+
+impl Metadata for MetaProgressive {
+    const META_TYPE: u32 = spa_sys::SPA_META_Progressive;
+}
+
+#[cfg(test)]
+mod progressive_tests {
+    use super::*;
+
+    #[test]
+    fn progressive_metadata_matches_native_version_one_abi() {
+        assert_eq!(
+            std::mem::size_of::<MetaProgressive>(),
+            spa_sys::SPA_META_PROGRESSIVE_SIZE as usize
+        );
+        assert_eq!(std::mem::align_of::<MetaProgressive>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(spa_sys::spa_meta_progressive, snapshot),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(spa_sys::spa_meta_progressive, reserved1),
+            40
+        );
+        assert_eq!(MetaProgressive::META_TYPE, spa_sys::SPA_META_Progressive);
+    }
+
+    #[test]
+    fn progressive_metadata_publishes_atomic_observations() {
+        let mut meta = MetaProgressive::new(1, 128, 4096, 256).unwrap();
+        meta.validate().unwrap();
+        assert_eq!(
+            meta.observe_acquire().unwrap(),
+            ProgressiveObservation {
+                snapshot: ProgressiveSnapshot::new(0, ProgressiveState::Prepared),
+                terminal_flags: None,
+            }
+        );
+
+        meta.store_release(ProgressiveSnapshot::new(1024, ProgressiveState::Active));
+        assert_eq!(meta.load_acquire().unwrap().committed_bytes(), 1024);
+        assert_eq!(meta.observe_acquire().unwrap().terminal_flags(), None);
+
+        meta.set_terminal_flags(ProgressiveFlags::INCOMPLETE | ProgressiveFlags::CANCELLED);
+        meta.store_release(ProgressiveSnapshot::new(1024, ProgressiveState::Aborted));
+        assert_eq!(
+            meta.observe_acquire().unwrap().terminal_flags(),
+            Some(ProgressiveFlags::INCOMPLETE | ProgressiveFlags::CANCELLED)
+        );
+        meta.validate().unwrap();
+    }
+
+    #[test]
+    fn progressive_metadata_rejects_malformed_values() {
+        assert!(MetaProgressive::new(0, 0, 0, 1).is_err());
+        assert!(MetaProgressive::new(0, 0, 1024, 0).is_err());
+        assert!(MetaProgressive::new(0, 0, 1024, 2048).is_err());
+
+        let meta = MetaProgressive::new(0, 0, 1024, 256).unwrap();
+        meta.snapshot_atomic().store(
+            spa_sys::SPA_META_PROGRESSIVE_RESERVED_MASK as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+        assert_eq!(meta.validate(), Err(ProgressiveMetaError));
+    }
+}
