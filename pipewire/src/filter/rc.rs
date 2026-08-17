@@ -50,6 +50,23 @@ pub enum BufferLatestWaitPolicy {
     Hybrid { spin_iterations: u32 },
 }
 
+/// Producer-local accounting for bounded latest-buffer acquisition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BufferLatestStats {
+    /// Output acquisition duty cycles.
+    pub dequeue_attempts: u64,
+    /// Returned consumer leases examined.
+    pub recycle_returns: u64,
+    /// Reusable pool slots examined.
+    pub buffer_probes: u64,
+    /// Attempts that found no safely reusable allocation.
+    pub pool_exhaustions: u64,
+    /// Unclaimed publications reclaimed after a full scan.
+    pub ready_reclaims: u64,
+    /// Largest number of pool slots examined by one scan.
+    pub max_buffer_probes: u32,
+}
+
 impl BufferLatestWaitPolicy {
     /// Value to set on [`BUFFER_LATEST_WAIT_PROPERTY`] before connecting.
     pub const fn port_property_value(self) -> &'static str {
@@ -367,6 +384,7 @@ impl<D> FilterPortRc<D> {
     pub unsafe fn buffer_latest(&mut self) -> FilterBufferLatestPort<'_> {
         FilterBufferLatestPort {
             port_data: self.registration.port_data,
+            idle: None,
             lifetime: std::marker::PhantomData,
             not_sync: std::marker::PhantomData,
         }
@@ -394,6 +412,7 @@ unsafe impl<D: Sync> Sync for FilterPortRc<D> {}
 /// the natural way to satisfy its lifetime and teardown contract.
 pub struct FilterBufferLatestPort<'p> {
     port_data: ptr::NonNull<ffi::c_void>,
+    idle: Option<BufferLatestIdle>,
     lifetime: std::marker::PhantomData<&'p mut ()>,
     not_sync: std::marker::PhantomData<Cell<()>>,
 }
@@ -404,10 +423,14 @@ impl FilterBufferLatestPort<'_> {
     /// The mutable borrow prevents a worker from holding a second buffer from
     /// this port before the first buffer is returned.
     pub fn dequeue_buffer(&mut self) -> Option<Buffer<'_>> {
-        unsafe {
-            let buffer = pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr());
-            Buffer::from_filter_raw(buffer, self.port_data)
+        let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr()) };
+        if buffer.is_null() {
+            return None;
         }
+        if let Some(idle) = &mut self.idle {
+            idle.reset();
+        }
+        unsafe { Buffer::from_filter_raw(buffer, self.port_data) }
     }
 
     /// Returns the borrowed advisory eventfd selected for this port.
@@ -421,6 +444,29 @@ impl FilterBufferLatestPort<'_> {
         Ok(unsafe { BorrowedFd::borrow_raw(fd) })
     }
 
+    /// Snapshots bounded producer-side acquisition accounting.
+    ///
+    /// This method is valid only for an output worker. The exclusive worker
+    /// must not call it concurrently with another dequeue or publication.
+    pub fn stats(&self) -> io::Result<BufferLatestStats> {
+        let mut raw = std::mem::MaybeUninit::<pw_sys::pw_filter_buffer_latest_stats>::uninit();
+        let result = unsafe {
+            pw_sys::pw_filter_get_buffer_latest_stats(self.port_data.as_ptr(), raw.as_mut_ptr())
+        };
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        let raw = unsafe { raw.assume_init() };
+        Ok(BufferLatestStats {
+            dequeue_attempts: raw.dequeue_attempts,
+            recycle_returns: raw.recycle_returns,
+            buffer_probes: raw.buffer_probes,
+            pool_exhaustions: raw.pool_exhaustions,
+            ready_reclaims: raw.ready_reclaims,
+            max_buffer_probes: raw.max_buffer_probes,
+        })
+    }
+
     /// Waits until a buffer is available using the selected receiver policy.
     ///
     /// Eventfd is advisory: this method always treats latest-buffer shared
@@ -429,7 +475,8 @@ impl FilterBufferLatestPort<'_> {
     /// negotiated; they never silently fall back to busy-spinning.
     ///
     /// This form has no deadline. The caller must arrange an in-band terminal
-    /// buffer or another process-level shutdown mechanism.
+    /// buffer or another process-level shutdown mechanism. A worker must use
+    /// one policy for its lifetime; changing it after the first wait fails.
     pub fn wait_dequeue(&mut self, policy: BufferLatestWaitPolicy) -> io::Result<Buffer<'_>> {
         self.wait_dequeue_inner(policy, None).map(Option::unwrap)
     }
@@ -464,40 +511,96 @@ impl FilterBufferLatestPort<'_> {
             .notification_spin_iterations()
             .map(|spin_iterations| self.notification_raw_fd().map(|fd| (fd, spin_iterations)))
             .transpose()?;
-        let mut spins_remaining = notification.map_or(0, |(_, spins)| spins);
+        if self
+            .idle
+            .as_ref()
+            .is_some_and(|idle| idle.notification != notification)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latest-buffer wait policy changed after the worker started",
+            ));
+        }
+        let port_data = self.port_data;
+        let idle = self
+            .idle
+            .get_or_insert_with(|| BufferLatestIdle::new(notification));
 
         loop {
-            let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr()) };
-            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, self.port_data) } {
+            let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(port_data.as_ptr()) };
+            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
+                idle.idle(1);
                 return Ok(Some(buffer));
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Ok(None);
             }
 
-            let Some((fd, hybrid_spins)) = notification else {
-                std::hint::spin_loop();
+            let BufferLatestIdleAction::Wait(fd) = idle.idle(0) else {
                 continue;
             };
-            if spins_remaining > 0 {
-                spins_remaining -= 1;
-                std::hint::spin_loop();
-                continue;
-            }
 
             drain_eventfd(fd)?;
 
             // Close the check/drain race before sleeping. A publication either
             // appears here or leaves the eventfd readable for poll below.
-            let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(self.port_data.as_ptr()) };
-            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, self.port_data) } {
+            let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(port_data.as_ptr()) };
+            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
+                idle.idle(1);
                 return Ok(Some(buffer));
             }
             if !poll_eventfd(fd, deadline)? {
                 return Ok(None);
             }
-            spins_remaining = hybrid_spins;
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufferLatestIdleAction {
+    Worked,
+    Spin,
+    Wait(RawFd),
+}
+
+/// Agrona-style work-count idle state for one latest-buffer agent.
+///
+/// A positive work count resets Hybrid to its prepared spin phase. Advisory
+/// wakeups do not reset it; only authoritative shared-state work does.
+struct BufferLatestIdle {
+    notification: Option<(RawFd, u32)>,
+    idle_cycles: u32,
+}
+
+impl BufferLatestIdle {
+    const fn new(notification: Option<(RawFd, u32)>) -> Self {
+        Self {
+            notification,
+            idle_cycles: 0,
+        }
+    }
+
+    fn idle(&mut self, work_count: usize) -> BufferLatestIdleAction {
+        if work_count > 0 {
+            self.reset();
+            return BufferLatestIdleAction::Worked;
+        }
+
+        let Some((fd, max_spins)) = self.notification else {
+            std::hint::spin_loop();
+            return BufferLatestIdleAction::Spin;
+        };
+        if self.idle_cycles < max_spins {
+            self.idle_cycles += 1;
+            std::hint::spin_loop();
+            BufferLatestIdleAction::Spin
+        } else {
+            BufferLatestIdleAction::Wait(fd)
+        }
+    }
+
+    const fn reset(&mut self) {
+        self.idle_cycles = 0;
     }
 }
 
@@ -729,6 +832,27 @@ mod latest_wait_tests {
             .port_property_value(),
             "hybrid"
         );
+    }
+
+    #[test]
+    fn hybrid_idle_resets_only_after_work() {
+        let mut idle = BufferLatestIdle::new(Some((7, 2)));
+
+        assert_eq!(idle.idle(0), BufferLatestIdleAction::Spin);
+        assert_eq!(idle.idle(0), BufferLatestIdleAction::Spin);
+        assert_eq!(idle.idle(0), BufferLatestIdleAction::Wait(7));
+        assert_eq!(idle.idle(0), BufferLatestIdleAction::Wait(7));
+        assert_eq!(idle.idle(1), BufferLatestIdleAction::Worked);
+        assert_eq!(idle.idle(0), BufferLatestIdleAction::Spin);
+    }
+
+    #[test]
+    fn busy_spin_and_eventfd_idle_without_hidden_phases() {
+        let mut busy_spin = BufferLatestIdle::new(None);
+        let mut eventfd = BufferLatestIdle::new(Some((11, 0)));
+
+        assert_eq!(busy_spin.idle(0), BufferLatestIdleAction::Spin);
+        assert_eq!(eventfd.idle(0), BufferLatestIdleAction::Wait(11));
     }
 
     #[test]
