@@ -36,8 +36,58 @@ pub const BUFFER_LATEST_IO_ID: u32 = 11;
 /// SPA I/O identifier for the process-local latest-buffer notification fd.
 pub const BUFFER_LATEST_NOTIFY_IO_ID: u32 = 12;
 
+/// SPA I/O identifier for one process-local latest-buffer link descriptor.
+pub const BUFFER_LATEST_LINK_IO_ID: u32 = 13;
+
 /// Input-port property used to select latest-buffer receiver waiting.
 pub const BUFFER_LATEST_WAIT_PROPERTY: &str = "port.buffer-latest.wait";
+
+/// Snapshot of one latest-buffer link change delivered by `io_changed`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferLatestLinkInfo {
+    /// Process-local link/mix identifier.
+    pub id: u32,
+    /// Whether this descriptor installs or retires the link.
+    pub active: bool,
+    /// Advisory notification descriptor, when negotiated for this link.
+    pub notification_fd: Option<RawFd>,
+}
+
+impl BufferLatestLinkInfo {
+    /// Decodes a latest-buffer link descriptor from an `io_changed` callback.
+    ///
+    /// Returns `None` for another I/O type, a missing descriptor, or an invalid
+    /// descriptor. The shared mailbox pointer deliberately remains private;
+    /// applications operate it through [`FilterBufferLatestPort`].
+    ///
+    /// # Safety
+    ///
+    /// `area` must be null or point to at least `size` readable bytes for the
+    /// duration of the callback. The returned value is an immediate snapshot
+    /// and does not borrow the descriptor.
+    pub unsafe fn from_io_changed(io_id: u32, area: *const ffi::c_void, size: u32) -> Option<Self> {
+        if io_id != BUFFER_LATEST_LINK_IO_ID
+            || area.is_null()
+            || (size as usize) < std::mem::size_of::<spa_sys::spa_io_buffers_latest_link>()
+        {
+            return None;
+        }
+        let raw = area.cast::<spa_sys::spa_io_buffers_latest_link>().read();
+        const ACTIVE: u32 = 1;
+        if raw.reserved != 0
+            || raw.flags & !ACTIVE != 0
+            || raw.notify_fd < -1
+            || (raw.flags & ACTIVE != 0 && raw.io.is_null())
+        {
+            return None;
+        }
+        Some(Self {
+            id: raw.id,
+            active: raw.flags & ACTIVE != 0,
+            notification_fd: (raw.notify_fd >= 0).then_some(raw.notify_fd),
+        })
+    }
+}
 
 /// Receiver-side waiting policy for a graph-independent latest-buffer link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,8 +113,30 @@ pub struct BufferLatestStats {
     pub pool_exhaustions: u64,
     /// Unclaimed publications reclaimed after a full scan.
     pub ready_reclaims: u64,
+    /// Subscriber ready slots withdrawn while reclaiming a pool buffer.
+    pub ready_withdrawals: u64,
+    /// Output buffers offered to the active fan-out set.
+    pub publications: u64,
+    /// Active subscriber mailboxes visited by publication.
+    pub subscriber_visits: u64,
+    /// Subscriber-local leases created by publication.
+    pub subscriber_deliveries: u64,
+    /// Subscriber-local ready IDs replaced by a newer publication.
+    pub subscriber_supersessions: u64,
+    /// Retired subscriber slots acknowledged by the producer.
+    pub subscriber_retirements: u64,
+    /// Outstanding subscriber leases recovered during retirement.
+    pub retired_leases: u64,
+    /// Publications that raced with removal and reached no active subscriber.
+    pub zero_recipient_publications: u64,
     /// Largest number of pool slots examined by one scan.
     pub max_buffer_probes: u32,
+    /// Largest aggregate recycle drain in one acquisition attempt.
+    pub max_recycle_returns: u32,
+    /// Largest number of ready mailboxes withdrawn in one reclaim attempt.
+    pub max_ready_withdrawals: u32,
+    /// Largest active fan-out visited by one publication.
+    pub max_subscriber_visits: u32,
 }
 
 impl BufferLatestWaitPolicy {
@@ -376,11 +448,12 @@ impl<D> FilterPortRc<D> {
     ///
     /// # Safety
     ///
-    /// The port must be connected by exactly one PipeWire buffer-latest link.
-    /// No graph process callback or other thread may dequeue or queue buffers
-    /// on this port while the handle exists. An input worker may hold only one
-    /// dequeued buffer at a time. The worker must stop and return the handle
-    /// before the filter is disconnected.
+    /// An input port must have at most one active PipeWire buffer-latest link;
+    /// an output port may fan out through the implementation's fixed subscriber
+    /// limit. No graph process callback or other thread may dequeue or queue
+    /// buffers on this port while the handle exists. An input worker may hold
+    /// only one dequeued buffer at a time. The worker must stop and return the
+    /// handle before its input link or filter is disconnected.
     pub unsafe fn buffer_latest(&mut self) -> FilterBufferLatestPort<'_> {
         FilterBufferLatestPort {
             port_data: self.registration.port_data,
@@ -463,7 +536,18 @@ impl FilterBufferLatestPort<'_> {
             buffer_probes: raw.buffer_probes,
             pool_exhaustions: raw.pool_exhaustions,
             ready_reclaims: raw.ready_reclaims,
+            ready_withdrawals: raw.ready_withdrawals,
+            publications: raw.publications,
+            subscriber_visits: raw.subscriber_visits,
+            subscriber_deliveries: raw.subscriber_deliveries,
+            subscriber_supersessions: raw.subscriber_supersessions,
+            subscriber_retirements: raw.subscriber_retirements,
+            retired_leases: raw.retired_leases,
+            zero_recipient_publications: raw.zero_recipient_publications,
             max_buffer_probes: raw.max_buffer_probes,
+            max_recycle_returns: raw.max_recycle_returns,
+            max_ready_withdrawals: raw.max_ready_withdrawals,
+            max_subscriber_visits: raw.max_subscriber_visits,
         })
     }
 
@@ -817,6 +901,7 @@ mod latest_wait_tests {
 
     #[test]
     fn policy_values_match_daemon_contract() {
+        assert_eq!(BUFFER_LATEST_LINK_IO_ID, 13);
         assert_eq!(
             BufferLatestWaitPolicy::BusySpin.port_property_value(),
             "busy-spin"
@@ -832,6 +917,49 @@ mod latest_wait_tests {
             .port_property_value(),
             "hybrid"
         );
+    }
+
+    #[test]
+    fn latest_link_callback_is_snapshotted_without_exposing_shared_io() {
+        let active = spa_sys::spa_io_buffers_latest_link {
+            id: 41,
+            flags: 1,
+            io: ptr::NonNull::<spa_sys::spa_io_buffers_latest>::dangling().as_ptr(),
+            notify_fd: 17,
+            reserved: 0,
+        };
+        let info = unsafe {
+            BufferLatestLinkInfo::from_io_changed(
+                BUFFER_LATEST_LINK_IO_ID,
+                ptr::addr_of!(active).cast(),
+                size_of_val(&active) as u32,
+            )
+        }
+        .expect("valid latest link must decode");
+        assert_eq!(
+            info,
+            BufferLatestLinkInfo {
+                id: 41,
+                active: true,
+                notification_fd: Some(17),
+            }
+        );
+
+        let retired = spa_sys::spa_io_buffers_latest_link {
+            flags: 0,
+            notify_fd: -1,
+            ..active
+        };
+        let info = unsafe {
+            BufferLatestLinkInfo::from_io_changed(
+                BUFFER_LATEST_LINK_IO_ID,
+                ptr::addr_of!(retired).cast(),
+                size_of_val(&retired) as u32,
+            )
+        }
+        .expect("valid retirement must decode");
+        assert!(!info.active);
+        assert_eq!(info.notification_fd, None);
     }
 
     #[test]
