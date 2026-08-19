@@ -513,6 +513,22 @@ impl FilterBufferLatestPort<'_> {
         unsafe { Buffer::from_filter_raw(buffer, self.port_data) }
     }
 
+    /// Tries to claim one input latest-buffer publication.
+    ///
+    /// Unlike [`Self::dequeue_buffer`], this does not inspect the ordinary
+    /// PipeWire port queue or use `errno`. `Ok(None)` is the expected no-work
+    /// result. Calling it on an output or ordinary port returns an error.
+    pub fn try_dequeue_input(&mut self) -> io::Result<Option<Buffer<'_>>> {
+        let buffer = try_dequeue_latest_raw(self.port_data)?;
+        if buffer.is_null() {
+            return Ok(None);
+        }
+        if let Some(idle) = &mut self.idle {
+            idle.reset();
+        }
+        Ok(unsafe { Buffer::from_filter_raw(buffer, self.port_data) })
+    }
+
     /// Returns the borrowed advisory eventfd selected for this port.
     ///
     /// The descriptor is owned by the connected filter and must not be closed.
@@ -572,6 +588,42 @@ impl FilterBufferLatestPort<'_> {
         self.wait_dequeue_inner(policy, None).map(Option::unwrap)
     }
 
+    /// Busy-spins until a buffer is available or `keep_running` returns false.
+    ///
+    /// This is the cooperative agent-loop form: each duty cycle checks the
+    /// caller's running condition, tries the shared latest-buffer mailbox, and
+    /// issues a processor spin hint when no work was found. It performs no
+    /// clock reads, allocation, eventfd operation, or ordinary queue probe.
+    /// Use [`Self::wait_dequeue`] with [`BufferLatestWaitPolicy::BusySpin`] when
+    /// even the running-condition check is unnecessary.
+    pub fn spin_dequeue_while<F>(&mut self, mut keep_running: F) -> io::Result<Option<Buffer<'_>>>
+    where
+        F: FnMut() -> bool,
+    {
+        if self
+            .idle
+            .as_ref()
+            .is_some_and(|idle| idle.notification.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latest-buffer wait policy changed after the worker started",
+            ));
+        }
+        let port_data = self.port_data;
+        let idle = self.idle.get_or_insert_with(|| BufferLatestIdle::new(None));
+
+        while keep_running() {
+            let buffer = try_dequeue_latest_raw(port_data)?;
+            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
+                idle.idle(1);
+                return Ok(Some(buffer));
+            }
+            idle.idle(0);
+        }
+        Ok(None)
+    }
+
     /// Waits until a buffer is available or `deadline` is reached.
     ///
     /// A buffer already visible at the deadline is returned. `Ok(None)` means
@@ -623,7 +675,7 @@ impl FilterBufferLatestPort<'_> {
         let mut spin_deadline = SpinDeadline::new(deadline);
 
         loop {
-            let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(port_data.as_ptr()) };
+            let buffer = try_dequeue_latest_raw(port_data)?;
             if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
                 idle.idle(1);
                 return Ok(Some(buffer));
@@ -643,7 +695,7 @@ impl FilterBufferLatestPort<'_> {
 
             // Close the check/drain race before sleeping. A publication either
             // appears here or leaves the eventfd readable for poll below.
-            let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(port_data.as_ptr()) };
+            let buffer = try_dequeue_latest_raw(port_data)?;
             if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
                 idle.idle(1);
                 return Ok(Some(buffer));
@@ -652,6 +704,21 @@ impl FilterBufferLatestPort<'_> {
                 return Ok(None);
             }
         }
+    }
+}
+
+fn try_dequeue_latest_raw(
+    port_data: ptr::NonNull<ffi::c_void>,
+) -> io::Result<*mut pw_sys::pw_buffer> {
+    let mut buffer = ptr::null_mut();
+    let result =
+        unsafe { pw_sys::pw_filter_try_dequeue_buffer_latest(port_data.as_ptr(), &mut buffer) };
+    match result {
+        0 => Ok(ptr::null_mut()),
+        1 if !buffer.is_null() => Ok(buffer),
+        1 => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+        result if result < 0 => Err(io::Error::from_raw_os_error(-result)),
+        _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
     }
 }
 
