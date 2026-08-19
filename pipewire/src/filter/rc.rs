@@ -585,7 +585,10 @@ impl FilterBufferLatestPort<'_> {
     /// buffer or another process-level shutdown mechanism. A worker must use
     /// one policy for its lifetime; changing it after the first wait fails.
     pub fn wait_dequeue(&mut self, policy: BufferLatestWaitPolicy) -> io::Result<Buffer<'_>> {
-        self.wait_dequeue_inner(policy, None).map(Option::unwrap)
+        match policy {
+            BufferLatestWaitPolicy::BusySpin => self.wait_dequeue_busy(None).map(Option::unwrap),
+            _ => self.wait_dequeue_inner(policy, None).map(Option::unwrap),
+        }
     }
 
     /// Busy-spins until a buffer is available or `keep_running` returns false.
@@ -611,10 +614,11 @@ impl FilterBufferLatestPort<'_> {
             ));
         }
         let port_data = self.port_data;
+        let mut poller = LatestInputPoller::new(port_data)?;
         let idle = self.idle.get_or_insert_with(|| BufferLatestIdle::new(None));
 
         while keep_running() {
-            let buffer = try_dequeue_latest_raw(port_data)?;
+            let buffer = poller.try_dequeue()?;
             if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
                 idle.idle(1);
                 return Ok(Some(buffer));
@@ -637,7 +641,10 @@ impl FilterBufferLatestPort<'_> {
         policy: BufferLatestWaitPolicy,
         deadline: Instant,
     ) -> io::Result<Option<Buffer<'_>>> {
-        self.wait_dequeue_inner(policy, Some(deadline))
+        match policy {
+            BufferLatestWaitPolicy::BusySpin => self.wait_dequeue_busy(Some(deadline)),
+            _ => self.wait_dequeue_inner(policy, Some(deadline)),
+        }
     }
 
     fn notification_raw_fd(&self) -> io::Result<RawFd> {
@@ -646,6 +653,35 @@ impl FilterBufferLatestPort<'_> {
             Err(io::Error::from_raw_os_error(-result))
         } else {
             Ok(result)
+        }
+    }
+
+    fn wait_dequeue_busy(&mut self, deadline: Option<Instant>) -> io::Result<Option<Buffer<'_>>> {
+        if self
+            .idle
+            .as_ref()
+            .is_some_and(|idle| idle.notification.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "latest-buffer wait policy changed after the worker started",
+            ));
+        }
+        let port_data = self.port_data;
+        let mut poller = LatestInputPoller::new(port_data)?;
+        let idle = self.idle.get_or_insert_with(|| BufferLatestIdle::new(None));
+        let mut spin_deadline = SpinDeadline::new(deadline);
+
+        loop {
+            let buffer = poller.try_dequeue()?;
+            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
+                idle.idle(1);
+                return Ok(Some(buffer));
+            }
+            idle.idle(0);
+            if spin_deadline.expired() {
+                return Ok(None);
+            }
         }
     }
 
@@ -713,12 +749,57 @@ fn try_dequeue_latest_raw(
     let mut buffer = ptr::null_mut();
     let result =
         unsafe { pw_sys::pw_filter_try_dequeue_buffer_latest(port_data.as_ptr(), &mut buffer) };
+    latest_dequeue_result(result, buffer)
+}
+
+fn latest_dequeue_result(
+    result: i32,
+    buffer: *mut pw_sys::pw_buffer,
+) -> io::Result<*mut pw_sys::pw_buffer> {
     match result {
         0 => Ok(ptr::null_mut()),
         1 if !buffer.is_null() => Ok(buffer),
         1 => Err(io::Error::from_raw_os_error(libc::EPROTO)),
         result if result < 0 => Err(io::Error::from_raw_os_error(-result)),
         _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+    }
+}
+
+/// Owns the C live-link pin for one continuous busy-spin polling interval.
+///
+/// The C poller keeps the pin after an empty dequeue and releases it on link
+/// change, success, or error. `Drop` covers cancellation, deadline, and unwind
+/// exits so a synchronous live detach cannot be left waiting on this worker.
+struct LatestInputPoller {
+    raw: pw_sys::pw_filter_buffer_latest_poller,
+}
+
+impl LatestInputPoller {
+    fn new(port_data: ptr::NonNull<ffi::c_void>) -> io::Result<Self> {
+        let mut raw = std::mem::MaybeUninit::uninit();
+        let result = unsafe {
+            pw_sys::pw_filter_buffer_latest_poller_init(raw.as_mut_ptr(), port_data.as_ptr())
+        };
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        Ok(Self {
+            raw: unsafe { raw.assume_init() },
+        })
+    }
+
+    fn try_dequeue(&mut self) -> io::Result<*mut pw_sys::pw_buffer> {
+        let mut buffer = ptr::null_mut();
+        let result = unsafe {
+            pw_sys::pw_filter_buffer_latest_poller_try_dequeue(&mut self.raw, &mut buffer)
+        };
+        latest_dequeue_result(result, buffer)
+    }
+}
+
+impl Drop for LatestInputPoller {
+    fn drop(&mut self) {
+        unsafe { pw_sys::pw_filter_buffer_latest_poller_clear(&mut self.raw) };
     }
 }
 
