@@ -42,6 +42,13 @@ pub const BUFFER_LATEST_LINK_IO_ID: u32 = 13;
 /// Input-port property used to select latest-buffer receiver waiting.
 pub const BUFFER_LATEST_WAIT_PROPERTY: &str = "port.buffer-latest.wait";
 
+/// Empty spin iterations between monotonic deadline checks.
+///
+/// BusySpin and Hybrid use an iteration bound instead of reading the clock on
+/// every empty shared-state poll. The first empty poll checks the deadline;
+/// subsequent checks are separated by at most this many empty polls.
+pub const BUFFER_LATEST_SPIN_DEADLINE_CHECK_INTERVAL: u32 = 256;
+
 /// Snapshot of one latest-buffer link change delivered by `io_changed`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferLatestLinkInfo {
@@ -568,7 +575,11 @@ impl FilterBufferLatestPort<'_> {
     /// Waits until a buffer is available or `deadline` is reached.
     ///
     /// A buffer already visible at the deadline is returned. `Ok(None)` means
-    /// no buffer was visible before the bounded wait ended.
+    /// no buffer was visible before the bounded wait ended. BusySpin and the
+    /// spinning phase of Hybrid amortize clock reads: after the first empty
+    /// poll, deadline observation may be delayed by at most
+    /// [`BUFFER_LATEST_SPIN_DEADLINE_CHECK_INTERVAL`] empty polls. Eventfd
+    /// waiting uses the deadline directly.
     pub fn wait_dequeue_until(
         &mut self,
         policy: BufferLatestWaitPolicy,
@@ -609,6 +620,7 @@ impl FilterBufferLatestPort<'_> {
         let idle = self
             .idle
             .get_or_insert_with(|| BufferLatestIdle::new(notification));
+        let mut spin_deadline = SpinDeadline::new(deadline);
 
         loop {
             let buffer = unsafe { pw_sys::pw_filter_dequeue_buffer(port_data.as_ptr()) };
@@ -616,12 +628,15 @@ impl FilterBufferLatestPort<'_> {
                 idle.idle(1);
                 return Ok(Some(buffer));
             }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Ok(None);
-            }
 
-            let BufferLatestIdleAction::Wait(fd) = idle.idle(0) else {
-                continue;
+            let fd = match idle.idle(0) {
+                BufferLatestIdleAction::Wait(fd) => fd,
+                BufferLatestIdleAction::Worked | BufferLatestIdleAction::Spin => {
+                    if spin_deadline.expired() {
+                        return Ok(None);
+                    }
+                    continue;
+                }
             };
 
             drain_eventfd(fd)?;
@@ -637,6 +652,32 @@ impl FilterBufferLatestPort<'_> {
                 return Ok(None);
             }
         }
+    }
+}
+
+struct SpinDeadline {
+    deadline: Option<Instant>,
+    polls_until_check: u32,
+}
+
+impl SpinDeadline {
+    const fn new(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            polls_until_check: 0,
+        }
+    }
+
+    fn expired(&mut self) -> bool {
+        let Some(deadline) = self.deadline else {
+            return false;
+        };
+        if self.polls_until_check > 0 {
+            self.polls_until_check -= 1;
+            return false;
+        }
+        self.polls_until_check = BUFFER_LATEST_SPIN_DEADLINE_CHECK_INTERVAL - 1;
+        Instant::now() >= deadline
     }
 }
 
@@ -981,6 +1022,44 @@ mod latest_wait_tests {
 
         assert_eq!(busy_spin.idle(0), BufferLatestIdleAction::Spin);
         assert_eq!(eventfd.idle(0), BufferLatestIdleAction::Wait(11));
+    }
+
+    #[test]
+    fn spin_deadline_check_is_iteration_bounded() {
+        let deadline = Instant::now() + Duration::from_secs(3_600);
+        let mut check = SpinDeadline::new(Some(deadline));
+
+        assert!(!check.expired());
+        assert_eq!(
+            check.polls_until_check,
+            BUFFER_LATEST_SPIN_DEADLINE_CHECK_INTERVAL - 1
+        );
+        for remaining in (1..BUFFER_LATEST_SPIN_DEADLINE_CHECK_INTERVAL).rev() {
+            assert!(!check.expired());
+            assert_eq!(check.polls_until_check, remaining - 1);
+        }
+        assert!(!check.expired());
+        assert_eq!(
+            check.polls_until_check,
+            BUFFER_LATEST_SPIN_DEADLINE_CHECK_INTERVAL - 1
+        );
+    }
+
+    #[test]
+    fn expired_spin_deadline_is_observed_on_first_empty_poll() {
+        let mut check = SpinDeadline::new(Some(Instant::now()));
+
+        assert!(check.expired());
+    }
+
+    #[test]
+    fn absent_spin_deadline_never_checks_or_expires() {
+        let mut check = SpinDeadline::new(None);
+
+        for _ in 0..BUFFER_LATEST_SPIN_DEADLINE_CHECK_INTERVAL * 2 {
+            assert!(!check.expired());
+        }
+        assert_eq!(check.polls_until_check, 0);
     }
 
     #[test]
