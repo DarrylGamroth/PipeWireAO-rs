@@ -93,7 +93,7 @@ impl RtcDataLoopConfig {
 /// negotiation, topology, and control events.
 pub struct RtcDataLoop<'context, F>
 where
-    F: FnMut() -> i32 + Send + 'static,
+    F: FnMut() -> i32 + Send + 'context,
 {
     ptr: ptr::NonNull<pw_sys::pw_rtc_data_loop>,
     process: Option<Box<F>>,
@@ -102,7 +102,7 @@ where
 
 impl<F> fmt::Debug for RtcDataLoop<'_, F>
 where
-    F: FnMut() -> i32 + Send + 'static,
+    F: FnMut() -> i32 + Send,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -115,7 +115,7 @@ where
 
 impl<'context, F> RtcDataLoop<'context, F>
 where
-    F: FnMut() -> i32 + Send + 'static,
+    F: FnMut() -> i32 + Send + 'context,
 {
     /// Create an RTC data loop using the `ThreadUtils` installed on `context`.
     pub fn new(
@@ -191,7 +191,7 @@ where
 
 impl<F> Drop for RtcDataLoop<'_, F>
 where
-    F: FnMut() -> i32 + Send + 'static,
+    F: FnMut() -> i32 + Send,
 {
     fn drop(&mut self) {
         unsafe {
@@ -218,6 +218,26 @@ fn result(value: i32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[allow(dead_code)]
+    fn borrowed_process_is_supported<'a>(
+        context: &'a Context,
+        count: &'a AtomicU32,
+    ) -> io::Result<RtcDataLoop<'a, impl FnMut() -> i32 + Send + 'a>> {
+        RtcDataLoop::new(
+            context,
+            None,
+            RtcDataLoopConfig {
+                idle: RtcIdle::BusySpin,
+                scheduler: RtcScheduler::Other,
+            },
+            move || {
+                count.fetch_add(1, Ordering::Relaxed);
+                1
+            },
+        )
+    }
 
     #[test]
     fn native_config_preserves_idle_and_scheduler_choices() {
