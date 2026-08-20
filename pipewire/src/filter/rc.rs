@@ -676,6 +676,7 @@ impl<'p, D> CompleteBufferRendezvous<'p, D> {
                 self.raw.as_ptr(),
                 monotonic_now_nanoseconds,
                 raw.as_mut_ptr(),
+                std::mem::size_of::<pw_sys::pw_filter_rendezvous_result>(),
             )
         };
         match result {
@@ -722,8 +723,13 @@ impl<'p, D> CompleteBufferRendezvous<'p, D> {
     /// Snapshots fixed single-writer classification and cleanup accounting.
     pub fn stats(&self) -> io::Result<RendezvousStats> {
         let mut raw = std::mem::MaybeUninit::uninit();
-        let result =
-            unsafe { pw_sys::pw_filter_rendezvous_get_stats(self.raw.as_ptr(), raw.as_mut_ptr()) };
+        let result = unsafe {
+            pw_sys::pw_filter_rendezvous_get_stats(
+                self.raw.as_ptr(),
+                raw.as_mut_ptr(),
+                std::mem::size_of::<pw_sys::pw_filter_rendezvous_stats>(),
+            )
+        };
         if result < 0 {
             return Err(io::Error::from_raw_os_error(-result));
         }
@@ -928,7 +934,11 @@ impl FilterBufferLatestPort<'_> {
     pub fn stats(&self) -> io::Result<BufferLatestStats> {
         let mut raw = std::mem::MaybeUninit::<pw_sys::pw_filter_buffer_latest_stats>::uninit();
         let result = unsafe {
-            pw_sys::pw_filter_get_buffer_latest_stats(self.port_data.as_ptr(), raw.as_mut_ptr())
+            pw_sys::pw_filter_get_buffer_latest_stats(
+                self.port_data.as_ptr(),
+                raw.as_mut_ptr(),
+                std::mem::size_of::<pw_sys::pw_filter_buffer_latest_stats>(),
+            )
         };
         if result < 0 {
             return Err(io::Error::from_raw_os_error(-result));
