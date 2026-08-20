@@ -801,8 +801,8 @@ impl VectorFormat {
         self.0.properties()
     }
 
-    pub fn enum_format(&self) -> NdArrayEnumFormat<[u32; 1]> {
-        NdArrayEnumFormat::new(self.0.clone())
+    pub fn enum_format(&self) -> VectorEnumFormat {
+        VectorEnumFormat::new(self.clone())
     }
 
     /// Parse a fixed native rank-one format.
@@ -844,8 +844,8 @@ impl MatrixFormat {
         self.0.properties()
     }
 
-    pub fn enum_format(&self) -> NdArrayEnumFormat<[u32; 2]> {
-        NdArrayEnumFormat::new(self.0.clone())
+    pub fn enum_format(&self) -> MatrixEnumFormat {
+        MatrixEnumFormat::new(self.clone())
     }
 
     /// Parse a fixed native rank-two format in either contiguous storage order.
@@ -864,6 +864,67 @@ impl MatrixFormat {
             format.layout(),
             format.rate(),
         )
+    }
+}
+
+/// Enumerated rank-one profile that preserves canonical row-major storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorEnumFormat(NdArrayEnumFormat<[u32; 1]>);
+
+impl VectorEnumFormat {
+    pub fn new(default: VectorFormat) -> Self {
+        Self(NdArrayEnumFormat::new(default.0))
+    }
+
+    pub fn with_element_type_alternatives(
+        self,
+        alternatives: impl IntoIterator<Item = ElementType>,
+    ) -> Result<Self, NdArrayFormatError> {
+        self.0
+            .with_element_type_alternatives(alternatives)
+            .map(Self)
+    }
+
+    pub fn with_rate_choice(self, choice: NdArrayRateChoice) -> Result<Self, NdArrayFormatError> {
+        self.0.with_rate_choice(choice).map(Self)
+    }
+
+    pub fn properties(&self) -> Vec<Property> {
+        self.0.properties()
+    }
+}
+
+/// Enumerated rank-two profile with negotiable row- or column-major storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixEnumFormat(NdArrayEnumFormat<[u32; 2]>);
+
+impl MatrixEnumFormat {
+    pub fn new(default: MatrixFormat) -> Self {
+        Self(NdArrayEnumFormat::new(default.0))
+    }
+
+    pub fn with_element_type_alternatives(
+        self,
+        alternatives: impl IntoIterator<Item = ElementType>,
+    ) -> Result<Self, NdArrayFormatError> {
+        self.0
+            .with_element_type_alternatives(alternatives)
+            .map(Self)
+    }
+
+    pub fn with_layout_alternatives(
+        self,
+        alternatives: impl IntoIterator<Item = NdArrayLayout>,
+    ) -> Result<Self, NdArrayFormatError> {
+        self.0.with_layout_alternatives(alternatives).map(Self)
+    }
+
+    pub fn with_rate_choice(self, choice: NdArrayRateChoice) -> Result<Self, NdArrayFormatError> {
+        self.0.with_rate_choice(choice).map(Self)
+    }
+
+    pub fn properties(&self) -> Vec<Property> {
+        self.0.properties()
     }
 }
 
@@ -1319,8 +1380,7 @@ mod tests {
             Err(NdArrayFormatError::UnsupportedElementTypeAlternative { index: 0 })
         );
         assert_eq!(
-            without_rate
-                .enum_format()
+            NdArrayEnumFormat::new(without_rate.as_ndarray().clone())
                 .with_layout_alternatives([NdArrayLayout::Unknown]),
             Err(NdArrayFormatError::UnsupportedLayoutAlternative { index: 0 })
         );
