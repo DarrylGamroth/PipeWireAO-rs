@@ -124,7 +124,7 @@ key_constant!(PRIORITY_DRIVER, PW_KEY_PRIORITY_DRIVER,
     /// priority to be a driver
 );
 key_constant!(REMOTE_NAME, PW_KEY_REMOTE_NAME,
-    /// The name of the remote to connect to, default `pipewire-ao`, overridden by env(PIPEWIREAO_REMOTE).
+    /// The name of the remote to connect to, default `pipewire-ao-0`, overridden by env(PIPEWIREAO_REMOTE).
 );
 key_constant!(REMOTE_INTENTION, PW_KEY_REMOTE_INTENTION,
     /// The intention of the remote connection, "generic", "screencast"
