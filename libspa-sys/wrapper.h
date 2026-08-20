@@ -37,6 +37,8 @@
 
 #include <spa/param/format-utils.h>
 #include <spa/param/format.h>
+#include <spa/param/ndarray-utils.h>
+#include <spa/param/ndarray.h>
 #if PW_CHECK_VERSION(0,3,29)
 #include <spa/param/latency-utils.h>
 #endif

@@ -3,13 +3,14 @@
 
 //! Types for dealing with SPA formats.
 
+use std::cmp::Ordering;
 use std::ffi::CStr;
 use std::fmt::Debug;
 use std::ops::Range;
 
 use crate::{
-    pod::{Property, Value, ValueArray},
-    utils::{fmt_pascal_case, Fraction, Id},
+    pod::{ChoiceValue, Property, Value, ValueArray},
+    utils::{fmt_pascal_case, Choice, ChoiceEnum, ChoiceFlags, Fraction, Id},
 };
 
 /// Different media types
@@ -257,7 +258,6 @@ impl Debug for ElementType {
             Self::I32Le => "ElementType::I32Le",
             Self::U32Le => "ElementType::U32Le",
             Self::I64Le => "ElementType::I64Le",
-            Self::U64Le => "ElementType::U64Le",
             Self::I128Le => "ElementType::I128Le",
             Self::U128Le => "ElementType::U128Le",
             Self::F8E4M3Fn => "ElementType::F8E4M3Fn",
@@ -330,6 +330,10 @@ pub enum NdArrayFormatError {
     InvalidProperty(FormatProperties),
     WrongRank { expected: usize, actual: usize },
     NonCanonicalVectorLayout,
+    UnsupportedElementTypeAlternative { index: usize },
+    UnsupportedLayoutAlternative { index: usize },
+    MissingRateForChoice,
+    InvalidRateChoice,
 }
 
 impl std::fmt::Display for NdArrayFormatError {
@@ -360,6 +364,16 @@ impl std::fmt::Display for NdArrayFormatError {
             Self::NonCanonicalVectorLayout => {
                 f.write_str("rank-one vectors must use the canonical row-major layout")
             }
+            Self::UnsupportedElementTypeAlternative { index } => {
+                write!(f, "unsupported ndarray element-type alternative {index}")
+            }
+            Self::UnsupportedLayoutAlternative { index } => {
+                write!(f, "unsupported ndarray layout alternative {index}")
+            }
+            Self::MissingRateForChoice => {
+                f.write_str("an ndarray rate choice requires a default rate")
+            }
+            Self::InvalidRateChoice => f.write_str("invalid ndarray rate choice"),
         }
     }
 }
@@ -565,6 +579,207 @@ impl<S: AsRef<[u32]>> NdArrayFormat<S> {
     }
 }
 
+/// Alternatives for the default rate of an enumerated ndarray format.
+///
+/// The default itself comes from [`NdArrayFormat::rate`]. Enum alternatives
+/// do not need to repeat it; serialization adds the repetition required by
+/// SPA's preference-plus-admissible-list representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NdArrayRateChoice {
+    /// Discrete additional rates.
+    Enum(Vec<Fraction>),
+    /// Inclusive rate range.
+    Range { min: Fraction, max: Fraction },
+    /// Inclusive rate range and positive step.
+    Step {
+        min: Fraction,
+        max: Fraction,
+        step: Fraction,
+    },
+}
+
+fn fraction_is_positive(value: Fraction) -> bool {
+    value.num != 0 && value.denom != 0
+}
+
+fn fraction_cmp(left: Fraction, right: Fraction) -> Ordering {
+    let left_product = u64::from(left.num) * u64::from(right.denom);
+    let right_product = u64::from(right.num) * u64::from(left.denom);
+    left_product.cmp(&right_product)
+}
+
+fn validate_rate_choice(
+    default: Option<Fraction>,
+    choice: &NdArrayRateChoice,
+) -> Result<(), NdArrayFormatError> {
+    let default = default.ok_or(NdArrayFormatError::MissingRateForChoice)?;
+    match choice {
+        NdArrayRateChoice::Enum(alternatives) => {
+            if alternatives.is_empty()
+                || alternatives
+                    .iter()
+                    .copied()
+                    .any(|rate| !fraction_is_positive(rate))
+            {
+                return Err(NdArrayFormatError::InvalidRateChoice);
+            }
+        }
+        NdArrayRateChoice::Range { min, max } | NdArrayRateChoice::Step { min, max, .. } => {
+            if !fraction_is_positive(*min)
+                || !fraction_is_positive(*max)
+                || fraction_cmp(*min, default) == Ordering::Greater
+                || fraction_cmp(default, *max) == Ordering::Greater
+            {
+                return Err(NdArrayFormatError::InvalidRateChoice);
+            }
+            if let NdArrayRateChoice::Step { step, .. } = choice {
+                if !fraction_is_positive(*step) {
+                    return Err(NdArrayFormatError::InvalidRateChoice);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One exact ndarray shape with negotiable scalar, layout, and rate values.
+///
+/// Endpoints supporting more than one shape expose one `NdArrayEnumFormat`
+/// per shape. This keeps shape negotiation unambiguous and compatible with
+/// the ordinary SPA POD filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NdArrayEnumFormat<S> {
+    default: NdArrayFormat<S>,
+    element_type_alternatives: Vec<ElementType>,
+    layout_alternatives: Vec<NdArrayLayout>,
+    rate_choice: Option<NdArrayRateChoice>,
+}
+
+impl<S: AsRef<[u32]>> NdArrayEnumFormat<S> {
+    /// Start an enumerated format from a validated fixed default.
+    pub fn new(default: NdArrayFormat<S>) -> Self {
+        Self {
+            default,
+            element_type_alternatives: Vec::new(),
+            layout_alternatives: Vec::new(),
+            rate_choice: None,
+        }
+    }
+
+    pub fn default(&self) -> &NdArrayFormat<S> {
+        &self.default
+    }
+
+    pub fn with_element_type_alternatives(
+        mut self,
+        alternatives: impl IntoIterator<Item = ElementType>,
+    ) -> Result<Self, NdArrayFormatError> {
+        self.element_type_alternatives = alternatives.into_iter().collect();
+        for (index, element_type) in self.element_type_alternatives.iter().enumerate() {
+            if element_type.size().is_none() {
+                return Err(NdArrayFormatError::UnsupportedElementTypeAlternative { index });
+            }
+        }
+        Ok(self)
+    }
+
+    pub fn with_layout_alternatives(
+        mut self,
+        alternatives: impl IntoIterator<Item = NdArrayLayout>,
+    ) -> Result<Self, NdArrayFormatError> {
+        self.layout_alternatives = alternatives.into_iter().collect();
+        for (index, layout) in self.layout_alternatives.iter().enumerate() {
+            if *layout != NdArrayLayout::RowMajor && *layout != NdArrayLayout::ColumnMajor {
+                return Err(NdArrayFormatError::UnsupportedLayoutAlternative { index });
+            }
+        }
+        Ok(self)
+    }
+
+    pub fn with_rate_choice(
+        mut self,
+        choice: NdArrayRateChoice,
+    ) -> Result<Self, NdArrayFormatError> {
+        validate_rate_choice(self.default.rate(), &choice)?;
+        self.rate_choice = Some(choice);
+        Ok(self)
+    }
+
+    /// Build an `SPA_PARAM_EnumFormat` property set.
+    pub fn properties(&self) -> Vec<Property> {
+        let mut properties = self.default.properties();
+
+        if !self.element_type_alternatives.is_empty() {
+            let default = Id(self.default.element_type().as_raw());
+            let mut alternatives = Vec::with_capacity(self.element_type_alternatives.len() + 1);
+            alternatives.push(default);
+            alternatives.extend(
+                self.element_type_alternatives
+                    .iter()
+                    .map(|element_type| Id(element_type.as_raw())),
+            );
+            properties[2].value = Value::Choice(ChoiceValue::Id(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default,
+                    alternatives,
+                },
+            )));
+        }
+
+        if !self.layout_alternatives.is_empty() {
+            let default = Id(self.default.layout().as_raw());
+            let mut alternatives = Vec::with_capacity(self.layout_alternatives.len() + 1);
+            alternatives.push(default);
+            alternatives.extend(
+                self.layout_alternatives
+                    .iter()
+                    .map(|layout| Id(layout.as_raw())),
+            );
+            properties[4].value = Value::Choice(ChoiceValue::Id(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default,
+                    alternatives,
+                },
+            )));
+        }
+
+        if let Some(choice) = &self.rate_choice {
+            let default = self.default.rate().expect("validated rate choice");
+            let choice = match choice {
+                NdArrayRateChoice::Enum(additional) => {
+                    let mut alternatives = Vec::with_capacity(additional.len() + 1);
+                    alternatives.push(default);
+                    alternatives.extend(additional.iter().copied());
+                    ChoiceEnum::Enum {
+                        default,
+                        alternatives,
+                    }
+                }
+                NdArrayRateChoice::Range { min, max } => ChoiceEnum::Range {
+                    default,
+                    min: *min,
+                    max: *max,
+                },
+                NdArrayRateChoice::Step { min, max, step } => ChoiceEnum::Step {
+                    default,
+                    min: *min,
+                    max: *max,
+                    step: *step,
+                },
+            };
+            let rate = properties
+                .iter_mut()
+                .find(|property| property.key == FormatProperties::NdArrayRate.as_raw())
+                .expect("validated default rate");
+            rate.value = Value::Choice(ChoiceValue::Fraction(Choice(ChoiceFlags::empty(), choice)));
+        }
+
+        properties
+    }
+}
+
 /// Canonical rank-one ndarray format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorFormat(NdArrayFormat<[u32; 1]>);
@@ -584,6 +799,10 @@ impl VectorFormat {
 
     pub fn properties(&self) -> Vec<Property> {
         self.0.properties()
+    }
+
+    pub fn enum_format(&self) -> NdArrayEnumFormat<[u32; 1]> {
+        NdArrayEnumFormat::new(self.0.clone())
     }
 
     /// Parse a fixed native rank-one format.
@@ -623,6 +842,10 @@ impl MatrixFormat {
 
     pub fn properties(&self) -> Vec<Property> {
         self.0.properties()
+    }
+
+    pub fn enum_format(&self) -> NdArrayEnumFormat<[u32; 2]> {
+        NdArrayEnumFormat::new(self.0.clone())
     }
 
     /// Parse a fixed native rank-two format in either contiguous storage order.
@@ -900,6 +1123,36 @@ mod tests {
     }
 
     #[test]
+    fn ndarray_c_information_helpers_are_bound() {
+        let mut shape = [0; spa_sys::SPA_NDARRAY_MAX_DIMENSIONS as usize];
+        shape[..2].copy_from_slice(&[48, 64]);
+        let info = spa_sys::spa_ndarray_info {
+            element_type: spa_sys::SPA_ELEMENT_TYPE_F32_LE,
+            layout: spa_sys::SPA_NDARRAY_LAYOUT_COLUMN_MAJOR,
+            rate: Fraction {
+                num: 1000,
+                denom: 1,
+            },
+            n_dimensions: 2,
+            shape,
+        };
+        let mut n_elements = 0;
+        let mut n_bytes = 0;
+
+        assert_eq!(unsafe { spa_sys::spa_ndarray_info_validate(&info) }, 0);
+        assert_eq!(
+            unsafe { spa_sys::spa_ndarray_info_get_n_elements(&info, &mut n_elements) },
+            0
+        );
+        assert_eq!(
+            unsafe { spa_sys::spa_ndarray_info_get_size(&info, &mut n_bytes) },
+            0
+        );
+        assert_eq!(n_elements, 48 * 64);
+        assert_eq!(n_bytes, 48 * 64 * std::mem::size_of::<f32>());
+    }
+
+    #[test]
     fn ndarray_properties_use_native_shape_and_layout_ids() {
         let matrix =
             MatrixFormat::new(ElementType::F32Le, 3, 5, NdArrayLayout::ColumnMajor, None).unwrap();
@@ -966,6 +1219,135 @@ mod tests {
         assert_eq!(
             VectorFormat::from_properties(&properties),
             Err(NdArrayFormatError::NonCanonicalVectorLayout)
+        );
+    }
+
+    #[test]
+    fn ndarray_enum_format_uses_standard_choices_and_exact_shape() {
+        let default = MatrixFormat::new(
+            ElementType::F64Le,
+            16,
+            16,
+            NdArrayLayout::ColumnMajor,
+            Some(Fraction {
+                num: 1000,
+                denom: 1,
+            }),
+        )
+        .unwrap();
+        let format = default
+            .enum_format()
+            .with_element_type_alternatives([ElementType::F32Le])
+            .unwrap()
+            .with_layout_alternatives([NdArrayLayout::RowMajor])
+            .unwrap()
+            .with_rate_choice(NdArrayRateChoice::Range {
+                min: Fraction { num: 500, denom: 1 },
+                max: Fraction {
+                    num: 2000,
+                    denom: 1,
+                },
+            })
+            .unwrap();
+        let properties = format.properties();
+
+        assert_eq!(
+            properties[2].value,
+            Value::Choice(ChoiceValue::Id(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: Id(ElementType::F64Le.as_raw()),
+                    alternatives: vec![
+                        Id(ElementType::F64Le.as_raw()),
+                        Id(ElementType::F32Le.as_raw()),
+                    ],
+                },
+            )))
+        );
+        assert_eq!(
+            properties[3].value,
+            Value::ValueArray(ValueArray::Int(vec![16, 16]))
+        );
+        assert_eq!(
+            properties[4].value,
+            Value::Choice(ChoiceValue::Id(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: Id(NdArrayLayout::ColumnMajor.as_raw()),
+                    alternatives: vec![
+                        Id(NdArrayLayout::ColumnMajor.as_raw()),
+                        Id(NdArrayLayout::RowMajor.as_raw()),
+                    ],
+                },
+            )))
+        );
+        assert_eq!(
+            properties[5].value,
+            Value::Choice(ChoiceValue::Fraction(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: Fraction {
+                        num: 1000,
+                        denom: 1,
+                    },
+                    min: Fraction { num: 500, denom: 1 },
+                    max: Fraction {
+                        num: 2000,
+                        denom: 1,
+                    },
+                },
+            )))
+        );
+    }
+
+    #[test]
+    fn ndarray_enum_format_rejects_invalid_alternatives() {
+        let without_rate = VectorFormat::new(ElementType::F32Le, 8, None).unwrap();
+        assert_eq!(
+            without_rate
+                .enum_format()
+                .with_rate_choice(NdArrayRateChoice::Range {
+                    min: Fraction { num: 1, denom: 1 },
+                    max: Fraction { num: 2, denom: 1 },
+                }),
+            Err(NdArrayFormatError::MissingRateForChoice)
+        );
+        assert_eq!(
+            without_rate
+                .enum_format()
+                .with_element_type_alternatives([ElementType::Unknown]),
+            Err(NdArrayFormatError::UnsupportedElementTypeAlternative { index: 0 })
+        );
+        assert_eq!(
+            without_rate
+                .enum_format()
+                .with_layout_alternatives([NdArrayLayout::Unknown]),
+            Err(NdArrayFormatError::UnsupportedLayoutAlternative { index: 0 })
+        );
+
+        let with_rate = VectorFormat::new(
+            ElementType::F32Le,
+            8,
+            Some(Fraction {
+                num: 1000,
+                denom: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            with_rate
+                .enum_format()
+                .with_rate_choice(NdArrayRateChoice::Range {
+                    min: Fraction {
+                        num: 1500,
+                        denom: 1,
+                    },
+                    max: Fraction {
+                        num: 2000,
+                        denom: 1,
+                    },
+                }),
+            Err(NdArrayFormatError::InvalidRateChoice)
         );
     }
 }
