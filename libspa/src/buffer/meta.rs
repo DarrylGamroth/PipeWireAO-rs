@@ -675,6 +675,7 @@ impl std::fmt::Display for AcquisitionMetaError {
 impl std::error::Error for AcquisitionMetaError {}
 
 /// Version 1 acquisition identity and qualified exposure time.
+#[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct MetaAcquisition(spa_sys::spa_meta_acquisition);
 
@@ -688,6 +689,13 @@ impl MetaAcquisition {
             "aligned Rust acquisition metadata failed to initialize"
         );
         Self(unsafe { raw.assume_init() })
+    }
+
+    /// Validates and wraps a native Version 1 metadata value.
+    pub fn from_raw(raw: spa_sys::spa_meta_acquisition) -> Result<Self, AcquisitionMetaError> {
+        let acquisition = Self(raw);
+        acquisition.validate()?;
+        Ok(acquisition)
     }
 
     /// Clears reusable metadata to its valid, empty Version 1 state.
@@ -930,6 +938,20 @@ mod acquisition_tests {
             Err(AcquisitionMetaError)
         );
         assert_eq!(meta.set_exposure_duration(0), Err(AcquisitionMetaError));
+    }
+
+    #[test]
+    fn native_acquisition_values_are_validated_when_wrapped() {
+        let mut meta = MetaAcquisition::new();
+        meta.set_identity(AcquisitionIdentity::new(domain(1), 7, 42))
+            .unwrap();
+
+        let wrapped = MetaAcquisition::from_raw(*meta.as_raw()).unwrap();
+        assert_eq!(wrapped.identity(), meta.identity());
+
+        let mut malformed = *meta.as_raw();
+        malformed.reserved[0] = 1;
+        assert!(MetaAcquisition::from_raw(malformed).is_err());
     }
 }
 

@@ -21,6 +21,10 @@ use crate::{
     properties::PropertiesBox,
     Error,
 };
+use spa::buffer::{
+    meta::{MetaAcquisition, Metadata},
+    Data,
+};
 use spa::utils::result::SpaResult;
 
 use super::{
@@ -144,6 +148,69 @@ pub struct BufferLatestStats {
     pub max_ready_withdrawals: u32,
     /// Largest active fan-out visited by one publication.
     pub max_subscriber_visits: u32,
+}
+
+/// Maximum number of positions in one prepared complete-buffer rendezvous.
+pub const MAX_RENDEZVOUS_INPUTS: usize = 64;
+
+/// Release behavior for one explicitly prepared complete-buffer rendezvous.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RendezvousReleasePolicy {
+    /// Release as soon as every required input is present, or at the deadline.
+    CompleteOrDeadline,
+    /// Release only at the first decision at or after the configured time.
+    FixedRelease,
+}
+
+/// Event that made one complete-buffer rendezvous result eligible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RendezvousReleaseCause {
+    /// Every required input arrived before the absolute release time.
+    Complete,
+    /// An incomplete complete-or-deadline acquisition reached its release time.
+    Deadline,
+    /// A fixed-phase acquisition reached its release time.
+    FixedRelease,
+}
+
+/// One immutable complete-buffer rendezvous decision.
+#[derive(Clone, Copy, Debug)]
+pub struct RendezvousRelease {
+    /// Complete expected acquisition metadata copied when the acquisition began.
+    pub acquisition: MetaAcquisition,
+    /// Bit set for every position whose matching buffer lease was retained.
+    pub accepted_inputs: u64,
+    /// Required positions without a matching buffer at release.
+    pub missing_required_inputs: u64,
+    /// Event that made this result eligible.
+    pub cause: RendezvousReleaseCause,
+}
+
+/// Fixed single-writer accounting for one complete-buffer rendezvous.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RendezvousStats {
+    /// Matching observations retained in their input positions.
+    pub accepted: u64,
+    /// Reserved for duplicate observations suppressed by retained-position gating.
+    pub duplicate: u64,
+    /// Observations that preceded the active acquisition.
+    pub stale: u64,
+    /// Observations that followed the active acquisition.
+    pub future: u64,
+    /// Invalid, progressive, or different-domain observations.
+    pub rejected: u64,
+    /// Early releases with every required input present.
+    pub complete_releases: u64,
+    /// Complete-or-deadline releases at the absolute release time.
+    pub deadline_releases: u64,
+    /// Fixed-phase releases at the absolute release time.
+    pub fixed_releases: u64,
+    /// Sum of missing required positions over all release decisions.
+    pub missing_required_inputs: u64,
+    /// Buffer leases returned to their input ports.
+    pub lease_returns: u64,
+    /// Failed lease-return attempts.
+    pub cleanup_errors: u64,
 }
 
 impl BufferLatestWaitPolicy {
@@ -484,6 +551,315 @@ impl<D> FilterPortRc<D> {
     pub unsafe fn dsp_buffer(&self, n_samples: u32) -> *mut ffi::c_void {
         pw_sys::pw_filter_get_dsp_buffer(self.registration.port_data.as_ptr(), n_samples)
     }
+}
+
+/// Caller-polled coordination of matching complete buffers from multiple inputs.
+///
+/// This is a client-side lease owner, not a graph scheduler. [`Self::poll`]
+/// performs one bounded scan using caller-supplied monotonic time. Matching
+/// leases remain borrowed through [`RendezvousBuffer`] until [`Self::finish`],
+/// [`Self::cancel`], [`Self::reset`], or drop returns them.
+pub struct CompleteBufferRendezvous<'p, D = ()> {
+    raw: ptr::NonNull<pw_sys::pw_filter_rendezvous>,
+    input_count: usize,
+    required_inputs: u64,
+    release_policy: RendezvousReleasePolicy,
+    ports: std::marker::PhantomData<&'p mut [FilterPortRc<D>]>,
+    not_sync: std::marker::PhantomData<Cell<()>>,
+}
+
+impl<'p, D> CompleteBufferRendezvous<'p, D> {
+    /// Prepares a fixed input set and starts exclusive latest-buffer ownership.
+    ///
+    /// Preparation may allocate. Polling, buffer access, release decisions, and
+    /// lease return do not allocate. The application must select this facility
+    /// explicitly; PipeWireAO does not activate it from graph topology.
+    ///
+    /// # Safety
+    ///
+    /// Every port must be a latest-buffer input with at most one active link.
+    /// No process callback or other thread may dequeue or queue these ports
+    /// until this rendezvous is dropped. The filter must remain connected, and
+    /// installed pools must remain unchanged, for the rendezvous lifetime.
+    pub unsafe fn prepare(
+        ports: &'p mut [FilterPortRc<D>],
+        required_inputs: u64,
+        release_policy: RendezvousReleasePolicy,
+    ) -> io::Result<Self> {
+        let raw_policy = match release_policy {
+            RendezvousReleasePolicy::CompleteOrDeadline => {
+                pw_sys::pw_filter_rendezvous_release_policy_PW_FILTER_RENDEZVOUS_RELEASE_COMPLETE_OR_DEADLINE
+            }
+            RendezvousReleasePolicy::FixedRelease => {
+                pw_sys::pw_filter_rendezvous_release_policy_PW_FILTER_RENDEZVOUS_RELEASE_FIXED
+            }
+        };
+        let raw_ports: Vec<*mut ffi::c_void> = ports
+            .iter()
+            .map(|port| port.registration.port_data.as_ptr())
+            .collect();
+        let mut raw = ptr::null_mut();
+        let result = pw_sys::pw_filter_rendezvous_new(
+            &mut raw,
+            raw_ports.as_ptr(),
+            u32::try_from(raw_ports.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many rendezvous inputs")
+            })?,
+            required_inputs,
+            raw_policy,
+        );
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        let raw =
+            ptr::NonNull::new(raw).ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?;
+        Ok(Self {
+            raw,
+            input_count: ports.len(),
+            required_inputs,
+            release_policy,
+            ports: std::marker::PhantomData,
+            not_sync: std::marker::PhantomData,
+        })
+    }
+
+    /// Returns the prepared input count and per-poll scan bound.
+    pub const fn input_count(&self) -> usize {
+        self.input_count
+    }
+
+    /// Returns the prepared nonempty required-input mask.
+    pub const fn required_inputs(&self) -> u64 {
+        self.required_inputs
+    }
+
+    /// Returns the prepared release behavior.
+    pub const fn release_policy(&self) -> RendezvousReleasePolicy {
+        self.release_policy
+    }
+
+    /// Begins one expected acquisition after prior leases were returned.
+    ///
+    /// `release_at_nanoseconds` is an absolute value in the caller's local
+    /// Linux `CLOCK_MONOTONIC` domain. Domain replacement requires
+    /// `discontinuity`; repeated or regressing identities are rejected.
+    pub fn begin(
+        &mut self,
+        acquisition: &MetaAcquisition,
+        release_at_nanoseconds: u64,
+        discontinuity: bool,
+    ) -> io::Result<()> {
+        let result = unsafe {
+            pw_sys::pw_filter_rendezvous_begin(
+                self.raw.as_ptr(),
+                acquisition.as_raw(),
+                release_at_nanoseconds,
+                discontinuity,
+            )
+        };
+        rendezvous_operation_result(result)
+    }
+
+    /// Performs one bounded scan and returns a release decision when eligible.
+    ///
+    /// This method does not wait or read a clock. `monotonic_now_nanoseconds`
+    /// must use the same local `CLOCK_MONOTONIC` domain as the prepared release
+    /// time. A returned result retains its accepted leases until a terminal
+    /// lifecycle operation returns them.
+    pub fn poll(
+        &mut self,
+        monotonic_now_nanoseconds: u64,
+    ) -> io::Result<Option<RendezvousRelease>> {
+        let mut raw = std::mem::MaybeUninit::uninit();
+        let result = unsafe {
+            pw_sys::pw_filter_rendezvous_poll(
+                self.raw.as_ptr(),
+                monotonic_now_nanoseconds,
+                raw.as_mut_ptr(),
+            )
+        };
+        match result {
+            0 => Ok(None),
+            1 => rendezvous_release_from_raw(unsafe { raw.assume_init() }).map(Some),
+            result if result < 0 => Err(io::Error::from_raw_os_error(-result)),
+            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+        }
+    }
+
+    /// Borrows one accepted complete buffer after a release decision.
+    ///
+    /// The buffer exposes immutable data and metadata only. Its borrow prevents
+    /// a safe terminal operation from returning the underlying lease while it
+    /// is still in use.
+    pub fn accepted_buffer(&self, input_index: usize) -> Option<RendezvousBuffer<'_>> {
+        let input_index = u32::try_from(input_index).ok()?;
+        let buffer =
+            unsafe { pw_sys::pw_filter_rendezvous_get_buffer(self.raw.as_ptr(), input_index) };
+        ptr::NonNull::new(buffer).map(|raw| RendezvousBuffer {
+            raw,
+            rendezvous: std::marker::PhantomData,
+        })
+    }
+
+    /// Returns every retained lease and completes the released acquisition.
+    pub fn finish(&mut self) -> io::Result<()> {
+        let result = unsafe { pw_sys::pw_filter_rendezvous_finish(self.raw.as_ptr()) };
+        rendezvous_operation_result(result)
+    }
+
+    /// Returns every retained lease and cancels only the active acquisition.
+    pub fn cancel(&mut self) -> io::Result<()> {
+        let result = unsafe { pw_sys::pw_filter_rendezvous_cancel(self.raw.as_ptr()) };
+        rendezvous_operation_result(result)
+    }
+
+    /// Cancels active work and clears completed-acquisition ordering state.
+    pub fn reset(&mut self) -> io::Result<()> {
+        let result = unsafe { pw_sys::pw_filter_rendezvous_reset(self.raw.as_ptr()) };
+        rendezvous_operation_result(result)
+    }
+
+    /// Snapshots fixed single-writer classification and cleanup accounting.
+    pub fn stats(&self) -> io::Result<RendezvousStats> {
+        let mut raw = std::mem::MaybeUninit::uninit();
+        let result =
+            unsafe { pw_sys::pw_filter_rendezvous_get_stats(self.raw.as_ptr(), raw.as_mut_ptr()) };
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        let raw = unsafe { raw.assume_init() };
+        Ok(RendezvousStats {
+            accepted: raw.accepted,
+            duplicate: raw.duplicate,
+            stale: raw.stale,
+            future: raw.future,
+            rejected: raw.rejected,
+            complete_releases: raw.complete_releases,
+            deadline_releases: raw.deadline_releases,
+            fixed_releases: raw.fixed_releases,
+            missing_required_inputs: raw.missing_required_inputs,
+            lease_returns: raw.lease_returns,
+            cleanup_errors: raw.cleanup_errors,
+        })
+    }
+}
+
+impl<D> Drop for CompleteBufferRendezvous<'_, D> {
+    fn drop(&mut self) {
+        let result = unsafe { pw_sys::pw_filter_rendezvous_destroy(self.raw.as_ptr()) };
+        debug_assert_eq!(result, 0, "complete-buffer rendezvous cleanup failed");
+    }
+}
+
+// SAFETY: this handle borrows every port exclusively but carries only the C
+// rendezvous pointer to the worker. It cannot access or drop the retained Rc
+// registrations or application data from that thread. C owns the bounded
+// single-writer lease state and its worker-lifetime barriers.
+unsafe impl<D> Send for CompleteBufferRendezvous<'_, D> {}
+
+/// Immutable access to one complete buffer retained by a rendezvous decision.
+pub struct RendezvousBuffer<'r> {
+    raw: ptr::NonNull<pw_sys::pw_buffer>,
+    rendezvous: std::marker::PhantomData<&'r ()>,
+}
+
+impl RendezvousBuffer<'_> {
+    fn spa_buffer(&self) -> Option<&spa_sys::spa_buffer> {
+        let buffer = unsafe { self.raw.as_ref().buffer };
+        unsafe { buffer.as_ref() }
+    }
+
+    /// Returns immutable mapped data descriptors for this accepted buffer.
+    pub fn datas(&self) -> &[Data] {
+        let Some(buffer) = self.spa_buffer() else {
+            return &[];
+        };
+        if buffer.n_datas == 0 || buffer.datas.is_null() {
+            return &[];
+        }
+        unsafe {
+            std::slice::from_raw_parts(
+                buffer.datas.cast::<Data>(),
+                usize::try_from(buffer.n_datas).expect("SPA data count does not fit usize"),
+            )
+        }
+    }
+
+    /// Returns one immutable mapped allocation by data index.
+    ///
+    /// The corresponding [`Data::chunk`] identifies the valid payload range.
+    /// A DMA-BUF without a mapped data pointer returns `None`.
+    pub fn data(&self, index: usize) -> Option<&[u8]> {
+        let buffer = self.spa_buffer()?;
+        if index >= buffer.n_datas as usize || buffer.datas.is_null() {
+            return None;
+        }
+        let data = unsafe { &*buffer.datas.add(index) };
+        if data.data.is_null() {
+            return None;
+        }
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                data.data.cast::<u8>(),
+                usize::try_from(data.maxsize).expect("SPA data size does not fit usize"),
+            )
+        })
+    }
+
+    /// Finds immutable metadata of type `T` attached to this accepted buffer.
+    pub fn find_meta<T: Metadata>(&self) -> Option<&T> {
+        let buffer = self.spa_buffer()?;
+        if buffer.n_metas == 0 {
+            return None;
+        }
+        let metadata = unsafe {
+            match T::META_TYPE {
+                spa_sys::SPA_META_VideoDamage => {
+                    spa_sys::spa_buffer_find_meta(buffer, T::META_TYPE).cast::<T>()
+                }
+                _ => spa_sys::spa_buffer_find_meta_data(
+                    buffer,
+                    T::META_TYPE,
+                    std::mem::size_of::<T>(),
+                )
+                .cast::<T>(),
+            }
+        };
+        unsafe { metadata.as_ref() }
+    }
+}
+
+fn rendezvous_operation_result(result: i32) -> io::Result<()> {
+    if result < 0 {
+        Err(io::Error::from_raw_os_error(-result))
+    } else {
+        Ok(())
+    }
+}
+
+fn rendezvous_release_from_raw(
+    raw: pw_sys::pw_filter_rendezvous_result,
+) -> io::Result<RendezvousRelease> {
+    let acquisition = MetaAcquisition::from_raw(raw.acquisition)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EPROTO))?;
+    let cause = match raw.cause {
+        pw_sys::pw_filter_rendezvous_release_cause_PW_FILTER_RENDEZVOUS_CAUSE_COMPLETE => {
+            RendezvousReleaseCause::Complete
+        }
+        pw_sys::pw_filter_rendezvous_release_cause_PW_FILTER_RENDEZVOUS_CAUSE_DEADLINE => {
+            RendezvousReleaseCause::Deadline
+        }
+        pw_sys::pw_filter_rendezvous_release_cause_PW_FILTER_RENDEZVOUS_CAUSE_FIXED => {
+            RendezvousReleaseCause::FixedRelease
+        }
+        _ => return Err(io::Error::from_raw_os_error(libc::EPROTO)),
+    };
+    Ok(RendezvousRelease {
+        acquisition,
+        accepted_inputs: raw.accepted_inputs,
+        missing_required_inputs: raw.missing_required_inputs,
+        cause,
+    })
 }
 
 // SAFETY: the retained Rc is never exposed or mutated from a callback. Shared
@@ -1099,10 +1475,26 @@ impl<D> Drop for FilterListenerRc<'_, D> {
 #[cfg(test)]
 mod latest_wait_tests {
     use super::*;
+    use spa::buffer::meta::AcquisitionIdentity;
+
+    fn acquisition(sequence: u64) -> MetaAcquisition {
+        let mut domain = [0; spa::buffer::meta::ACQUISITION_DOMAIN_SIZE];
+        domain[0] = 1;
+        let domain = spa::buffer::meta::AcquisitionDomain::new(domain).unwrap();
+        let mut acquisition = MetaAcquisition::new();
+        acquisition
+            .set_identity(AcquisitionIdentity::new(domain, 2, sequence))
+            .unwrap();
+        acquisition
+    }
 
     #[test]
     fn policy_values_match_daemon_contract() {
         assert_eq!(BUFFER_LATEST_LINK_IO_ID, 13);
+        assert_eq!(
+            MAX_RENDEZVOUS_INPUTS,
+            pw_sys::PW_FILTER_RENDEZVOUS_MAX_INPUTS as usize
+        );
         assert_eq!(
             BufferLatestWaitPolicy::BusySpin.port_property_value(),
             "busy-spin"
@@ -1118,6 +1510,51 @@ mod latest_wait_tests {
             .port_property_value(),
             "hybrid"
         );
+    }
+
+    #[test]
+    fn rendezvous_release_decodes_native_result() {
+        let acquisition = acquisition(42);
+        let raw = pw_sys::pw_filter_rendezvous_result {
+            acquisition: *acquisition.as_raw(),
+            accepted_inputs: 0b101,
+            missing_required_inputs: 0b010,
+            cause: pw_sys::pw_filter_rendezvous_release_cause_PW_FILTER_RENDEZVOUS_CAUSE_DEADLINE,
+            reserved: 0,
+        };
+
+        let release = rendezvous_release_from_raw(raw).unwrap();
+        assert_eq!(
+            release.acquisition.identity().unwrap().unwrap().sequence(),
+            42
+        );
+        assert_eq!(release.accepted_inputs, 0b101);
+        assert_eq!(release.missing_required_inputs, 0b010);
+        assert_eq!(release.cause, RendezvousReleaseCause::Deadline);
+    }
+
+    #[test]
+    fn rendezvous_rejects_unknown_native_release_cause() {
+        let acquisition = acquisition(42);
+        let raw = pw_sys::pw_filter_rendezvous_result {
+            acquisition: *acquisition.as_raw(),
+            accepted_inputs: 0,
+            missing_required_inputs: 0,
+            cause: u32::MAX,
+            reserved: 0,
+        };
+
+        assert_eq!(
+            rendezvous_release_from_raw(raw).unwrap_err().raw_os_error(),
+            Some(libc::EPROTO)
+        );
+    }
+
+    #[test]
+    fn rendezvous_worker_handle_is_send_without_sending_port_data() {
+        fn require_send<T: Send>() {}
+
+        require_send::<CompleteBufferRendezvous<'static, Rc<()>>>();
     }
 
     #[test]
