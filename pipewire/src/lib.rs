@@ -160,6 +160,7 @@ pub mod port;
 pub mod properties;
 pub mod proxy;
 pub mod registry;
+pub mod rtc_data_loop;
 pub mod stream;
 pub mod thread_loop;
 pub mod types;
