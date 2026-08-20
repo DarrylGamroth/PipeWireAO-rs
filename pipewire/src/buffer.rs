@@ -15,6 +15,13 @@ use std::sync::Arc;
 use crate::filter::FilterPortRegistration;
 use crate::Error;
 
+mod progressive;
+
+pub use progressive::{
+    ProgressiveBufferError, ProgressiveInput, ProgressiveOutputBuffer, ProgressiveRead,
+    ProgressiveWrite,
+};
+
 pub struct Buffer<'s> {
     buf: NonNull<pw_sys::pw_buffer>,
 
