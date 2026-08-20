@@ -599,6 +599,340 @@ impl Metadata for MetaSyncTimeline {
     const META_TYPE: u32 = spa_sys::SPA_META_SyncTimeline;
 }
 
+/// Number of bytes in a PipeWireAO acquisition-domain identifier.
+pub const ACQUISITION_DOMAIN_SIZE: usize = spa_sys::SPA_META_ACQUISITION_DOMAIN_SIZE as usize;
+
+bitflags::bitflags! {
+    /// Valid fields in [`MetaAcquisition`].
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    pub struct AcquisitionFlags: u32 {
+        const IDENTITY_VALID = spa_sys::SPA_META_ACQUISITION_FLAG_IDENTITY_VALID;
+        const EXPOSURE_START_VALID =
+            spa_sys::SPA_META_ACQUISITION_FLAG_EXPOSURE_START_VALID;
+        const EXPOSURE_DURATION_VALID =
+            spa_sys::SPA_META_ACQUISITION_FLAG_EXPOSURE_DURATION_VALID;
+    }
+}
+
+/// Opaque, nonzero acquisition-domain identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct AcquisitionDomain([u8; ACQUISITION_DOMAIN_SIZE]);
+
+impl AcquisitionDomain {
+    pub fn new(bytes: [u8; ACQUISITION_DOMAIN_SIZE]) -> Result<Self, AcquisitionMetaError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(AcquisitionMetaError);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; ACQUISITION_DOMAIN_SIZE] {
+        &self.0
+    }
+}
+
+/// Complete physical-acquisition identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AcquisitionIdentity {
+    domain: AcquisitionDomain,
+    generation: u64,
+    sequence: u64,
+}
+
+impl AcquisitionIdentity {
+    pub const fn new(domain: AcquisitionDomain, generation: u64, sequence: u64) -> Self {
+        Self {
+            domain,
+            generation,
+            sequence,
+        }
+    }
+
+    pub const fn domain(self) -> AcquisitionDomain {
+        self.domain
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+/// A mapped acquisition metadata allocation violates the native Version 1 ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcquisitionMetaError;
+
+impl std::fmt::Display for AcquisitionMetaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid PipeWireAO acquisition metadata")
+    }
+}
+
+impl std::error::Error for AcquisitionMetaError {}
+
+/// Version 1 acquisition identity and qualified exposure time.
+#[repr(transparent)]
+pub struct MetaAcquisition(spa_sys::spa_meta_acquisition);
+
+impl MetaAcquisition {
+    /// Creates valid metadata with no identity or exposure time established.
+    pub fn new() -> Self {
+        let mut raw = std::mem::MaybeUninit::<spa_sys::spa_meta_acquisition>::uninit();
+        let initialized = unsafe { spa_sys::spa_meta_acquisition_init(raw.as_mut_ptr()) };
+        assert!(
+            initialized,
+            "aligned Rust acquisition metadata failed to initialize"
+        );
+        Self(unsafe { raw.assume_init() })
+    }
+
+    /// Clears reusable metadata to its valid, empty Version 1 state.
+    pub fn initialize(&mut self) {
+        let initialized = unsafe { spa_sys::spa_meta_acquisition_init(self.as_raw_mut()) };
+        assert!(
+            initialized,
+            "aligned Rust acquisition metadata failed to initialize"
+        );
+    }
+
+    pub fn as_raw(&self) -> &spa_sys::spa_meta_acquisition {
+        &self.0
+    }
+
+    pub fn as_raw_mut(&mut self) -> &mut spa_sys::spa_meta_acquisition {
+        &mut self.0
+    }
+
+    pub fn version(&self) -> u32 {
+        self.0.version
+    }
+
+    pub fn abi_size(&self) -> u32 {
+        self.0.abi_size
+    }
+
+    pub fn flags(&self) -> Result<AcquisitionFlags, AcquisitionMetaError> {
+        self.validate()?;
+        AcquisitionFlags::from_bits(self.0.flags).ok_or(AcquisitionMetaError)
+    }
+
+    pub fn set_identity(
+        &mut self,
+        identity: AcquisitionIdentity,
+    ) -> Result<(), AcquisitionMetaError> {
+        let valid = unsafe {
+            spa_sys::spa_meta_acquisition_set_identity(
+                self.as_raw_mut(),
+                identity.domain.as_bytes().as_ptr(),
+                identity.generation,
+                identity.sequence,
+            )
+        };
+        valid.then_some(()).ok_or(AcquisitionMetaError)
+    }
+
+    pub fn identity(&self) -> Result<Option<AcquisitionIdentity>, AcquisitionMetaError> {
+        let flags = self.flags()?;
+        if !flags.contains(AcquisitionFlags::IDENTITY_VALID) {
+            return Ok(None);
+        }
+        Ok(Some(AcquisitionIdentity::new(
+            AcquisitionDomain(self.0.domain),
+            self.0.generation,
+            self.0.sequence,
+        )))
+    }
+
+    /// Sets exposure start in the local Linux `CLOCK_MONOTONIC` domain.
+    pub fn set_exposure_start(
+        &mut self,
+        nanoseconds: i64,
+        uncertainty_nanoseconds: u64,
+    ) -> Result<(), AcquisitionMetaError> {
+        let valid = unsafe {
+            spa_sys::spa_meta_acquisition_set_exposure_start(
+                self.as_raw_mut(),
+                nanoseconds,
+                uncertainty_nanoseconds,
+            )
+        };
+        valid.then_some(()).ok_or(AcquisitionMetaError)
+    }
+
+    /// Returns exposure start and its inclusive uncertainty bound.
+    pub fn exposure_start(&self) -> Result<Option<(i64, u64)>, AcquisitionMetaError> {
+        let flags = self.flags()?;
+        Ok(flags
+            .contains(AcquisitionFlags::EXPOSURE_START_VALID)
+            .then_some((
+                self.0.exposure_start_nsec,
+                self.0.timestamp_uncertainty_nsec,
+            )))
+    }
+
+    pub fn set_exposure_duration(&mut self, nanoseconds: u64) -> Result<(), AcquisitionMetaError> {
+        let valid = unsafe {
+            spa_sys::spa_meta_acquisition_set_exposure_duration(self.as_raw_mut(), nanoseconds)
+        };
+        valid.then_some(()).ok_or(AcquisitionMetaError)
+    }
+
+    pub fn exposure_duration(&self) -> Result<Option<u64>, AcquisitionMetaError> {
+        let flags = self.flags()?;
+        Ok(flags
+            .contains(AcquisitionFlags::EXPOSURE_DURATION_VALID)
+            .then_some(self.0.exposure_duration_nsec))
+    }
+
+    /// Uses the native helper to compare complete, valid identity tuples.
+    pub fn identity_equal(&self, other: &Self) -> bool {
+        unsafe { spa_sys::spa_meta_acquisition_identity_equal(self.as_raw(), other.as_raw()) }
+    }
+
+    /// Validates this allocation with the authoritative native helper.
+    pub fn validate(&self) -> Result<(), AcquisitionMetaError> {
+        let wrapper = spa_sys::spa_meta {
+            type_: spa_sys::SPA_META_Acquisition,
+            size: std::mem::size_of::<spa_sys::spa_meta_acquisition>() as u32,
+            data: std::ptr::addr_of!(self.0).cast_mut().cast(),
+        };
+        let valid = unsafe { spa_sys::spa_meta_acquisition_is_valid(&wrapper) };
+        valid.then_some(()).ok_or(AcquisitionMetaError)
+    }
+}
+
+impl Default for MetaAcquisition {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Debug for MetaAcquisition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetaAcquisition")
+            .field("version", &self.version())
+            .field("abi_size", &self.abi_size())
+            .field("flags", &self.flags())
+            .field("identity", &self.identity())
+            .field("exposure_start", &self.exposure_start())
+            .field("exposure_duration", &self.exposure_duration())
+            .finish()
+    }
+}
+
+impl Metadata for MetaAcquisition {
+    const META_TYPE: u32 = spa_sys::SPA_META_Acquisition;
+}
+
+#[cfg(test)]
+mod acquisition_tests {
+    use super::*;
+
+    fn domain(first_byte: u8) -> AcquisitionDomain {
+        let mut bytes = [0; ACQUISITION_DOMAIN_SIZE];
+        bytes[0] = first_byte;
+        AcquisitionDomain::new(bytes).unwrap()
+    }
+
+    #[test]
+    fn acquisition_metadata_matches_native_version_one_abi() {
+        assert_eq!(ACQUISITION_DOMAIN_SIZE, 16);
+        assert_eq!(
+            std::mem::size_of::<MetaAcquisition>(),
+            spa_sys::SPA_META_ACQUISITION_SIZE as usize
+        );
+        assert_eq!(std::mem::align_of::<MetaAcquisition>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(spa_sys::spa_meta_acquisition, domain),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(spa_sys::spa_meta_acquisition, generation),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(spa_sys::spa_meta_acquisition, sequence),
+            40
+        );
+        assert_eq!(
+            std::mem::offset_of!(spa_sys::spa_meta_acquisition, exposure_start_nsec),
+            48
+        );
+        assert_eq!(
+            std::mem::offset_of!(spa_sys::spa_meta_acquisition, reserved),
+            72
+        );
+        assert_eq!(MetaAcquisition::META_TYPE, spa_sys::SPA_META_Acquisition);
+        assert_eq!(
+            AcquisitionFlags::all().bits(),
+            spa_sys::SPA_META_ACQUISITION_FLAG_ALL
+        );
+    }
+
+    #[test]
+    fn acquisition_metadata_exposes_valid_identity_and_time() {
+        assert_eq!(
+            AcquisitionDomain::new([0; ACQUISITION_DOMAIN_SIZE]),
+            Err(AcquisitionMetaError)
+        );
+
+        let identity = AcquisitionIdentity::new(domain(1), 7, 42);
+        let mut meta = MetaAcquisition::new();
+        meta.validate().unwrap();
+        assert_eq!(meta.flags().unwrap(), AcquisitionFlags::empty());
+        assert_eq!(meta.identity().unwrap(), None);
+        assert_eq!(meta.exposure_start().unwrap(), None);
+        assert_eq!(meta.exposure_duration().unwrap(), None);
+
+        meta.set_identity(identity).unwrap();
+        meta.set_exposure_start(123_456, 9).unwrap();
+        meta.set_exposure_duration(5_000).unwrap();
+        meta.validate().unwrap();
+        assert_eq!(meta.identity().unwrap(), Some(identity));
+        assert_eq!(meta.exposure_start().unwrap(), Some((123_456, 9)));
+        assert_eq!(meta.exposure_duration().unwrap(), Some(5_000));
+
+        let mut same = MetaAcquisition::new();
+        same.set_identity(identity).unwrap();
+        assert!(meta.identity_equal(&same));
+        same.set_identity(AcquisitionIdentity::new(domain(1), 7, 43))
+            .unwrap();
+        assert!(!meta.identity_equal(&same));
+
+        meta.initialize();
+        assert_eq!(meta.identity().unwrap(), None);
+        assert_eq!(meta.as_raw().exposure_start_nsec, spa_sys::SPA_TIME_INVALID);
+    }
+
+    #[test]
+    fn acquisition_metadata_rejects_malformed_values() {
+        let mut meta = MetaAcquisition::new();
+        meta.set_identity(AcquisitionIdentity::new(domain(1), 7, 42))
+            .unwrap();
+        meta.as_raw_mut().flags |= 1 << 31;
+        assert_eq!(meta.validate(), Err(AcquisitionMetaError));
+
+        meta.initialize();
+        meta.as_raw_mut().reserved[0] = 1;
+        assert_eq!(meta.validate(), Err(AcquisitionMetaError));
+
+        meta.initialize();
+        meta.as_raw_mut().exposure_start_nsec = 0;
+        assert_eq!(meta.validate(), Err(AcquisitionMetaError));
+
+        meta.initialize();
+        assert_eq!(
+            meta.set_exposure_start(spa_sys::SPA_TIME_INVALID, 0),
+            Err(AcquisitionMetaError)
+        );
+        assert_eq!(meta.set_exposure_duration(0), Err(AcquisitionMetaError));
+    }
+}
+
 bitflags::bitflags! {
     /// Terminal outcome flags for [`MetaProgressive`].
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
