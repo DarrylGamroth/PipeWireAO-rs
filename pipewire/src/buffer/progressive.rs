@@ -44,7 +44,8 @@ impl std::error::Error for ProgressiveBufferError {}
 /// This owner never creates a mutable reference spanning the whole payload.
 /// Call [`Self::write_until`] to borrow only the producer-owned suffix and
 /// publish it with [`ProgressiveWrite::commit`]. Dropping an unterminated owner
-/// release-publishes `Aborted` before ending the PipeWireAO producer lease.
+/// release-publishes `Aborted | Cancelled` before ending the PipeWireAO
+/// producer lease.
 pub struct ProgressiveOutputBuffer<'f> {
     _lease: ProgressiveFilterBuffer<'f>,
     metadata: NonNull<MetaProgressive>,
@@ -222,6 +223,11 @@ impl<'f> ProgressiveOutputBuffer<'f> {
         Ok(())
     }
 
+    /// Publishes cancellation while preserving the last committed prefix.
+    pub fn cancel(&mut self) -> Result<(), ProgressiveBufferError> {
+        self.abort(ProgressiveFlags::CANCELLED)
+    }
+
     fn metadata(&self) -> &MetaProgressive {
         unsafe {
             // SAFETY: the PipeWireAO producer lease keeps the mapped buffer
@@ -234,7 +240,7 @@ impl<'f> ProgressiveOutputBuffer<'f> {
 impl Drop for ProgressiveOutputBuffer<'_> {
     fn drop(&mut self) {
         if !self.terminal {
-            let _ = self.abort(ProgressiveFlags::PROTOCOL_ERROR);
+            let _ = self.cancel();
         }
         // `_lease` is dropped next and ends the PipeWireAO producer lease.
     }

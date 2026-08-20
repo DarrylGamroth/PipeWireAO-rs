@@ -460,14 +460,19 @@ impl<D> FilterPortRc<D> {
     /// limit. No graph process callback or other thread may dequeue or queue
     /// buffers on this port while the handle exists. An input worker may hold
     /// only one dequeued buffer at a time. The worker must stop and return the
-    /// handle before its input link or filter is disconnected.
-    pub unsafe fn buffer_latest(&mut self) -> FilterBufferLatestPort<'_> {
-        FilterBufferLatestPort {
+    /// handle before disconnecting. While the returned handle exists,
+    /// PipeWireAO rejects filter disconnect, port removal, and installed-pool
+    /// replacement with `EBUSY`.
+    pub unsafe fn buffer_latest(&mut self) -> Result<FilterBufferLatestPort<'_>, Error> {
+        let result =
+            pw_sys::pw_filter_buffer_latest_worker_begin(self.registration.port_data.as_ptr());
+        SpaResult::from_c(result).into_result()?;
+        Ok(FilterBufferLatestPort {
             port_data: self.registration.port_data,
             idle: None,
             lifetime: std::marker::PhantomData,
             not_sync: std::marker::PhantomData,
-        }
+        })
     }
 
     /// Gets the port's DSP buffer pointer.
@@ -740,6 +745,13 @@ impl FilterBufferLatestPort<'_> {
                 return Ok(None);
             }
         }
+    }
+}
+
+impl Drop for FilterBufferLatestPort<'_> {
+    fn drop(&mut self) {
+        let result = unsafe { pw_sys::pw_filter_buffer_latest_worker_end(self.port_data.as_ptr()) };
+        debug_assert_eq!(result, 0, "latest-buffer worker ownership ended twice");
     }
 }
 

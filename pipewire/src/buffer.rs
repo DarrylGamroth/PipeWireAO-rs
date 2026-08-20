@@ -297,12 +297,13 @@ impl<'f> ProgressiveFilterBuffer<'f> {
 
 impl Drop for ProgressiveFilterBuffer<'_> {
     fn drop(&mut self) {
-        unsafe {
+        let result = unsafe {
             pw_sys::pw_filter_end_progressive_buffer(
                 self.port_data.as_ptr(),
                 self.buffer.buf.as_ptr(),
-            );
-        }
+            )
+        };
+        debug_assert_eq!(result, 0, "progressive producer lease ended twice");
     }
 }
 
