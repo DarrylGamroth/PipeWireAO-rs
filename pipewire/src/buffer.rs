@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::filter::FilterPortRegistration;
 use crate::Error;
 
+pub mod ndarray;
 mod progressive;
 
 pub use progressive::{

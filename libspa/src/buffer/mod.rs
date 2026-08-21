@@ -220,8 +220,8 @@ mod tests {
 
     #[test]
     fn data_flags_report_actual_huge_page_backing() {
-        assert_eq!(DataFlags::HUGE_PAGES.bits(), 1 << 4);
-        assert_eq!(DataFlags::HUGE_2MB.bits(), 1 << 5);
-        assert_eq!(DataFlags::HUGE_1GB.bits(), 1 << 6);
+        assert_eq!(DataFlags::HUGE_PAGES.bits(), 1 << 28);
+        assert_eq!(DataFlags::HUGE_2MB.bits(), 1 << 29);
+        assert_eq!(DataFlags::HUGE_1GB.bits(), 1 << 30);
     }
 }

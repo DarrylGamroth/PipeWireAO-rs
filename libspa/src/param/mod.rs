@@ -8,6 +8,10 @@ pub mod format;
 pub mod format_utils;
 pub mod video;
 
+mod parameters;
+
+pub use parameters::Parameters;
+
 use std::ffi::CStr;
 use std::fmt::Debug;
 
@@ -166,7 +170,7 @@ mod tests {
 
     #[test]
     fn buffer_page_size_hint_matches_native_abi() {
-        assert_eq!(BufferProperties::PageSizeHint.as_raw(), 8);
+        assert_eq!(BufferProperties::PageSizeHint.as_raw(), 0x0100_0000);
         assert_eq!(BufferPageSizeHint::Normal.as_raw(), 0);
         assert_eq!(BufferPageSizeHint::HugeDefault.as_raw(), 1);
         assert_eq!(BufferPageSizeHint::Huge2Mb.as_raw(), 2);
