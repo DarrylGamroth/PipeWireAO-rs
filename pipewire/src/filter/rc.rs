@@ -68,7 +68,7 @@ impl BufferLatestLinkInfo {
     /// Decodes a latest-buffer link descriptor from an `io_changed` callback.
     ///
     /// Returns `None` for another I/O type, a missing descriptor, or an invalid
-    /// descriptor. The shared mailbox pointer deliberately remains private;
+    /// descriptor. The shared channel pointer deliberately remains private;
     /// applications operate it through [`FilterBufferLatestPort`].
     ///
     /// # Safety
@@ -116,24 +116,24 @@ pub enum BufferLatestWaitPolicy {
 pub struct BufferLatestStats {
     /// Output acquisition duty cycles.
     pub dequeue_attempts: u64,
-    /// Returned consumer leases examined.
-    pub recycle_returns: u64,
+    /// Completed consumer leases examined.
+    pub completions: u64,
     /// Reusable pool slots examined.
     pub buffer_probes: u64,
     /// Attempts that found no safely reusable allocation.
     pub pool_exhaustions: u64,
-    /// Unclaimed publications reclaimed after a full scan.
-    pub ready_reclaims: u64,
-    /// Subscriber ready slots withdrawn while reclaiming a pool buffer.
-    pub ready_withdrawals: u64,
+    /// Unclaimed submissions reclaimed after a full scan.
+    pub submission_reclaims: u64,
+    /// Subscriber submissions withdrawn while reclaiming a pool buffer.
+    pub submission_withdrawals: u64,
     /// Output buffers offered to the active fan-out set.
     pub publications: u64,
-    /// Active subscriber mailboxes visited by publication.
+    /// Active subscriber channels visited by publication.
     pub subscriber_visits: u64,
     /// Subscriber-local leases created by publication.
     pub subscriber_deliveries: u64,
-    /// Subscriber-local ready IDs replaced by a newer publication.
-    pub subscriber_supersessions: u64,
+    /// Subscriber-local unclaimed submissions replaced by a newer publication.
+    pub submission_overflows: u64,
     /// Retired subscriber slots acknowledged by the producer.
     pub subscriber_retirements: u64,
     /// Outstanding subscriber leases recovered during retirement.
@@ -142,10 +142,10 @@ pub struct BufferLatestStats {
     pub zero_recipient_publications: u64,
     /// Largest number of pool slots examined by one scan.
     pub max_buffer_probes: u32,
-    /// Largest aggregate recycle drain in one acquisition attempt.
-    pub max_recycle_returns: u32,
-    /// Largest number of ready mailboxes withdrawn in one reclaim attempt.
-    pub max_ready_withdrawals: u32,
+    /// Largest aggregate completion drain in one acquisition attempt.
+    pub max_completions: u32,
+    /// Largest number of submissions withdrawn in one reclaim attempt.
+    pub max_submission_withdrawals: u32,
     /// Largest active fan-out visited by one publication.
     pub max_subscriber_visits: u32,
 }
@@ -920,16 +920,19 @@ impl FilterBufferLatestPort<'_> {
     ///
     /// Unlike [`Self::dequeue_buffer`], this does not inspect the ordinary
     /// PipeWire port queue or use `errno`. `Ok(None)` is the expected no-work
-    /// result. Calling it on an output or ordinary port returns an error.
+    /// result. The returned buffer exposes its transport sequence through
+    /// [`Buffer::submission_sequence`]. Calling this on an output or ordinary
+    /// port returns an error.
     pub fn try_dequeue_input(&mut self) -> io::Result<Option<Buffer<'_>>> {
-        let buffer = try_dequeue_latest_raw(self.port_data)?;
-        if buffer.is_null() {
+        let Some((buffer, submission_sequence)) = try_dequeue_latest_raw(self.port_data)? else {
             return Ok(None);
-        }
+        };
         if let Some(idle) = &mut self.idle {
             idle.reset();
         }
-        Ok(unsafe { Buffer::from_filter_raw(buffer, self.port_data) })
+        Ok(Some(unsafe {
+            Buffer::from_filter_latest_raw(buffer, self.port_data, submission_sequence)
+        }))
     }
 
     /// Returns the borrowed advisory eventfd selected for this port.
@@ -962,21 +965,21 @@ impl FilterBufferLatestPort<'_> {
         let raw = unsafe { raw.assume_init() };
         Ok(BufferLatestStats {
             dequeue_attempts: raw.dequeue_attempts,
-            recycle_returns: raw.recycle_returns,
+            completions: raw.completions,
             buffer_probes: raw.buffer_probes,
             pool_exhaustions: raw.pool_exhaustions,
-            ready_reclaims: raw.ready_reclaims,
-            ready_withdrawals: raw.ready_withdrawals,
+            submission_reclaims: raw.submission_reclaims,
+            submission_withdrawals: raw.submission_withdrawals,
             publications: raw.publications,
             subscriber_visits: raw.subscriber_visits,
             subscriber_deliveries: raw.subscriber_deliveries,
-            subscriber_supersessions: raw.subscriber_supersessions,
+            submission_overflows: raw.submission_overflows,
             subscriber_retirements: raw.subscriber_retirements,
             retired_leases: raw.retired_leases,
             zero_recipient_publications: raw.zero_recipient_publications,
             max_buffer_probes: raw.max_buffer_probes,
-            max_recycle_returns: raw.max_recycle_returns,
-            max_ready_withdrawals: raw.max_ready_withdrawals,
+            max_completions: raw.max_completions,
+            max_submission_withdrawals: raw.max_submission_withdrawals,
             max_subscriber_visits: raw.max_subscriber_visits,
         })
     }
@@ -1001,7 +1004,7 @@ impl FilterBufferLatestPort<'_> {
     /// Busy-spins until a buffer is available or `keep_running` returns false.
     ///
     /// This is the cooperative agent-loop form: each duty cycle checks the
-    /// caller's running condition, tries the shared latest-buffer mailbox, and
+    /// caller's running condition, tries the shared latest-buffer channel, and
     /// issues a processor spin hint when no work was found. It performs no
     /// clock reads, allocation, eventfd operation, or ordinary queue probe.
     /// Use [`Self::wait_dequeue`] with [`BufferLatestWaitPolicy::BusySpin`] when
@@ -1025,10 +1028,11 @@ impl FilterBufferLatestPort<'_> {
         let idle = self.idle.get_or_insert_with(|| BufferLatestIdle::new(None));
 
         while keep_running() {
-            let buffer = poller.try_dequeue()?;
-            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
+            if let Some((buffer, submission_sequence)) = poller.try_dequeue()? {
                 idle.idle(1);
-                return Ok(Some(buffer));
+                return Ok(Some(unsafe {
+                    Buffer::from_filter_latest_raw(buffer, port_data, submission_sequence)
+                }));
             }
             idle.idle(0);
         }
@@ -1080,10 +1084,11 @@ impl FilterBufferLatestPort<'_> {
         let mut spin_deadline = SpinDeadline::new(deadline);
 
         loop {
-            let buffer = poller.try_dequeue()?;
-            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
+            if let Some((buffer, submission_sequence)) = poller.try_dequeue()? {
                 idle.idle(1);
-                return Ok(Some(buffer));
+                return Ok(Some(unsafe {
+                    Buffer::from_filter_latest_raw(buffer, port_data, submission_sequence)
+                }));
             }
             idle.idle(0);
             if spin_deadline.expired() {
@@ -1118,10 +1123,11 @@ impl FilterBufferLatestPort<'_> {
         let mut spin_deadline = SpinDeadline::new(deadline);
 
         loop {
-            let buffer = try_dequeue_latest_raw(port_data)?;
-            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
+            if let Some((buffer, submission_sequence)) = try_dequeue_latest_raw(port_data)? {
                 idle.idle(1);
-                return Ok(Some(buffer));
+                return Ok(Some(unsafe {
+                    Buffer::from_filter_latest_raw(buffer, port_data, submission_sequence)
+                }));
             }
 
             let fd = match idle.idle(0) {
@@ -1138,10 +1144,11 @@ impl FilterBufferLatestPort<'_> {
 
             // Close the check/drain race before sleeping. A publication either
             // appears here or leaves the eventfd readable for poll below.
-            let buffer = try_dequeue_latest_raw(port_data)?;
-            if let Some(buffer) = unsafe { Buffer::from_filter_raw(buffer, port_data) } {
+            if let Some((buffer, submission_sequence)) = try_dequeue_latest_raw(port_data)? {
                 idle.idle(1);
-                return Ok(Some(buffer));
+                return Ok(Some(unsafe {
+                    Buffer::from_filter_latest_raw(buffer, port_data, submission_sequence)
+                }));
             }
             if !poll_eventfd(fd, deadline)? {
                 return Ok(None);
@@ -1159,21 +1166,30 @@ impl Drop for FilterBufferLatestPort<'_> {
 
 fn try_dequeue_latest_raw(
     port_data: ptr::NonNull<ffi::c_void>,
-) -> io::Result<*mut pw_sys::pw_buffer> {
+) -> io::Result<Option<(ptr::NonNull<pw_sys::pw_buffer>, std::num::NonZeroU64)>> {
     let mut buffer = ptr::null_mut();
-    let result =
-        unsafe { pw_sys::pw_filter_try_dequeue_buffer_latest(port_data.as_ptr(), &mut buffer) };
-    latest_dequeue_result(result, buffer)
+    let mut submission_sequence = 0;
+    let result = unsafe {
+        pw_sys::pw_filter_try_dequeue_buffer_latest(
+            port_data.as_ptr(),
+            &mut buffer,
+            &mut submission_sequence,
+        )
+    };
+    latest_dequeue_result(result, buffer, submission_sequence)
 }
 
 fn latest_dequeue_result(
     result: i32,
     buffer: *mut pw_sys::pw_buffer,
-) -> io::Result<*mut pw_sys::pw_buffer> {
+    submission_sequence: u64,
+) -> io::Result<Option<(ptr::NonNull<pw_sys::pw_buffer>, std::num::NonZeroU64)>> {
     match result {
-        0 => Ok(ptr::null_mut()),
-        1 if !buffer.is_null() => Ok(buffer),
-        1 => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+        0 => Ok(None),
+        1 => ptr::NonNull::new(buffer)
+            .zip(std::num::NonZeroU64::new(submission_sequence))
+            .map(Some)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO)),
         result if result < 0 => Err(io::Error::from_raw_os_error(-result)),
         _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
     }
@@ -1202,12 +1218,19 @@ impl LatestInputPoller {
         })
     }
 
-    fn try_dequeue(&mut self) -> io::Result<*mut pw_sys::pw_buffer> {
+    fn try_dequeue(
+        &mut self,
+    ) -> io::Result<Option<(ptr::NonNull<pw_sys::pw_buffer>, std::num::NonZeroU64)>> {
         let mut buffer = ptr::null_mut();
+        let mut submission_sequence = 0;
         let result = unsafe {
-            pw_sys::pw_filter_buffer_latest_poller_try_dequeue(&mut self.raw, &mut buffer)
+            pw_sys::pw_filter_buffer_latest_poller_try_dequeue(
+                &mut self.raw,
+                &mut buffer,
+                &mut submission_sequence,
+            )
         };
-        latest_dequeue_result(result, buffer)
+        latest_dequeue_result(result, buffer, submission_sequence)
     }
 }
 
@@ -1536,6 +1559,33 @@ mod latest_wait_tests {
             .port_property_value(),
             "hybrid"
         );
+    }
+
+    #[test]
+    fn latest_dequeue_requires_a_buffer_and_nonzero_sequence() {
+        let buffer = ptr::NonNull::<pw_sys::pw_buffer>::dangling().as_ptr();
+
+        assert!(latest_dequeue_result(0, ptr::null_mut(), 0)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            latest_dequeue_result(1, ptr::null_mut(), 1)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPROTO)
+        );
+        assert_eq!(
+            latest_dequeue_result(1, buffer, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPROTO)
+        );
+
+        let (received, sequence) = latest_dequeue_result(1, buffer, 17)
+            .unwrap()
+            .expect("valid latest dequeue must be present");
+        assert_eq!(received.as_ptr(), buffer);
+        assert_eq!(sequence.get(), 17);
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub use progressive::{
 pub struct Buffer<'s> {
     buf: NonNull<pw_sys::pw_buffer>,
 
+    /// Nonzero only when the specialized latest-input API returned the
+    /// transport submission sequence with this buffer.
+    submission_sequence: u64,
+
     /// In PipeWire, buffers are owned by the stream or filter port that
     /// generated them. The lifetime ensures that owner remains valid until
     /// the buffer is returned.
@@ -44,6 +48,7 @@ impl<'s> Buffer<'s> {
     ) -> Option<Buffer<'_>> {
         NonNull::new(buf).map(|buf| Buffer {
             buf,
+            submission_sequence: 0,
             owner: BufferOwner::Stream(stream),
         })
     }
@@ -54,8 +59,21 @@ impl<'s> Buffer<'s> {
     ) -> Option<Buffer<'a>> {
         NonNull::new(buf).map(|buf| Buffer {
             buf,
+            submission_sequence: 0,
             owner: BufferOwner::FilterPort(port_data, std::marker::PhantomData),
         })
+    }
+
+    pub(crate) unsafe fn from_filter_latest_raw<'a>(
+        buf: NonNull<pw_sys::pw_buffer>,
+        port_data: NonNull<std::ffi::c_void>,
+        submission_sequence: std::num::NonZeroU64,
+    ) -> Buffer<'a> {
+        Buffer {
+            buf,
+            submission_sequence: submission_sequence.get(),
+            owner: BufferOwner::FilterPort(port_data, std::marker::PhantomData),
+        }
     }
 
     pub(crate) unsafe fn from_filter_rc_raw(
@@ -64,8 +82,20 @@ impl<'s> Buffer<'s> {
     ) -> Option<Buffer<'static>> {
         NonNull::new(buf).map(|buf| Buffer {
             buf,
+            submission_sequence: 0,
             owner: BufferOwner::FilterPortRc(registration),
         })
+    }
+
+    /// Returns the transport sequence for a specialized latest-input dequeue.
+    ///
+    /// The sequence is publisher-local, monotonically increasing, and shared
+    /// by every subscriber that receives the same fan-out publication. It is
+    /// distinct from acquisition metadata used for semantic joins. Ordinary
+    /// stream and filter dequeues return `None` because those APIs do not
+    /// expose a latest-channel submission sequence.
+    pub fn submission_sequence(&self) -> Option<std::num::NonZeroU64> {
+        std::num::NonZeroU64::new(self.submission_sequence)
     }
 
     /// Retains a filter-port buffer beyond the callback that dequeued it.
