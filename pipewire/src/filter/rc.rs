@@ -576,10 +576,12 @@ impl<'p, D> CompleteBufferRendezvous<'p, D> {
     ///
     /// # Safety
     ///
-    /// Every port must be a latest-buffer input with at most one active link.
-    /// No process callback or other thread may dequeue or queue these ports
-    /// until this rendezvous is dropped. The filter must remain connected, and
-    /// installed pools must remain unchanged, for the rendezvous lifetime.
+    /// Every port must be an input with at most one active latest-buffer link.
+    /// A port may be unlinked during preparation and remains missing until a
+    /// compatible link is installed. No process callback or other thread may
+    /// dequeue or queue these ports until this rendezvous is dropped. The
+    /// filter must remain connected, and installed pools must remain unchanged,
+    /// for the rendezvous lifetime.
     pub unsafe fn prepare(
         ports: &'p mut [FilterPortRc<D>],
         required_inputs: u64,
