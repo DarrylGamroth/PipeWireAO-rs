@@ -191,8 +191,6 @@ pub struct RendezvousRelease {
 pub struct RendezvousStats {
     /// Matching observations retained in their input positions.
     pub accepted: u64,
-    /// Reserved for duplicate observations suppressed by retained-position gating.
-    pub duplicate: u64,
     /// Observations that preceded the active acquisition.
     pub stale: u64,
     /// Observations that followed the active acquisition.
@@ -735,9 +733,9 @@ impl<'p, D> CompleteBufferRendezvous<'p, D> {
             return Err(io::Error::from_raw_os_error(-result));
         }
         let raw = unsafe { raw.assume_init() };
+        debug_assert_eq!(raw.reserved0, 0);
         Ok(RendezvousStats {
             accepted: raw.accepted,
-            duplicate: raw.duplicate,
             stale: raw.stale,
             future: raw.future,
             rejected: raw.rejected,
