@@ -558,7 +558,8 @@ impl<D> FilterPortRc<D> {
 /// This is a client-side lease owner, not a graph scheduler. [`Self::poll`]
 /// performs one bounded scan using caller-supplied monotonic time. Matching
 /// leases remain borrowed through [`RendezvousBuffer`] until [`Self::finish`],
-/// [`Self::cancel`], [`Self::reset`], or drop returns them.
+/// [`Self::cancel`], or [`Self::reset`] returns them. Call [`Self::try_destroy`]
+/// when terminal cleanup can encounter a temporarily full buffer-return path.
 pub struct CompleteBufferRendezvous<'p, D = ()> {
     raw: ptr::NonNull<pw_sys::pw_filter_rendezvous>,
     input_count: usize,
@@ -747,6 +748,21 @@ impl<'p, D> CompleteBufferRendezvous<'p, D> {
             lease_returns: raw.lease_returns,
             cleanup_errors: raw.cleanup_errors,
         })
+    }
+
+    /// Attempts terminal cleanup while preserving ownership on failure.
+    ///
+    /// A retained lease can fail to return when its bounded recycle ring is
+    /// temporarily full. In that case this returns both the still-valid handle
+    /// and the error so the caller can restore the return path and retry. A
+    /// successful call ends every worker lifetime and consumes the handle.
+    pub fn try_destroy(self) -> Result<(), (Self, io::Error)> {
+        let result = unsafe { pw_sys::pw_filter_rendezvous_destroy(self.raw.as_ptr()) };
+        if result < 0 {
+            return Err((self, io::Error::from_raw_os_error(-result)));
+        }
+        std::mem::forget(self);
+        Ok(())
     }
 }
 
