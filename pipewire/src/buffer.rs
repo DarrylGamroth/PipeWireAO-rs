@@ -15,9 +15,11 @@ use std::sync::Arc;
 use crate::filter::FilterPortRegistration;
 use crate::Error;
 
+mod latest;
 pub mod ndarray;
 mod progressive;
 
+pub use latest::BufferLatestStats;
 pub use progressive::{
     ProgressiveBufferError, ProgressiveInput, ProgressiveOutputBuffer, ProgressiveRead,
     ProgressiveWrite,
@@ -52,6 +54,18 @@ impl<'s> Buffer<'s> {
             submission_sequence: 0,
             owner: BufferOwner::Stream(stream),
         })
+    }
+
+    pub(crate) unsafe fn from_stream_latest_raw<'a>(
+        buf: NonNull<pw_sys::pw_buffer>,
+        stream: &'a Stream,
+        submission_sequence: std::num::NonZeroU64,
+    ) -> Buffer<'a> {
+        Buffer {
+            buf,
+            submission_sequence: submission_sequence.get(),
+            owner: BufferOwner::Stream(stream),
+        }
     }
 
     pub(crate) unsafe fn from_filter_raw<'a>(

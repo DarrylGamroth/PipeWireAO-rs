@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::{
-    buffer::{Buffer, RetainedFilterBufferRc},
+    buffer::{Buffer, BufferLatestStats, RetainedFilterBufferRc},
     core::CoreRc,
     properties::PropertiesBox,
     Error,
@@ -109,45 +109,6 @@ pub enum BufferLatestWaitPolicy {
     EventFd,
     /// Poll shared state for a bounded number of iterations, then use eventfd.
     Hybrid { spin_iterations: u32 },
-}
-
-/// Producer-local accounting for bounded latest-buffer acquisition.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct BufferLatestStats {
-    /// Output acquisition duty cycles.
-    pub dequeue_attempts: u64,
-    /// Completed consumer leases examined.
-    pub completions: u64,
-    /// Reusable pool slots examined.
-    pub buffer_probes: u64,
-    /// Attempts that found no safely reusable allocation.
-    pub pool_exhaustions: u64,
-    /// Unclaimed submissions reclaimed after a full scan.
-    pub submission_reclaims: u64,
-    /// Subscriber submissions withdrawn while reclaiming a pool buffer.
-    pub submission_withdrawals: u64,
-    /// Output buffers offered to the active fan-out set.
-    pub publications: u64,
-    /// Active subscriber channels visited by publication.
-    pub subscriber_visits: u64,
-    /// Subscriber-local leases created by publication.
-    pub subscriber_deliveries: u64,
-    /// Subscriber-local unclaimed submissions replaced by a newer publication.
-    pub submission_overflows: u64,
-    /// Retired subscriber slots acknowledged by the producer.
-    pub subscriber_retirements: u64,
-    /// Outstanding subscriber leases recovered during retirement.
-    pub retired_leases: u64,
-    /// Publications that raced with removal and reached no active subscriber.
-    pub zero_recipient_publications: u64,
-    /// Largest number of pool slots examined by one scan.
-    pub max_buffer_probes: u32,
-    /// Largest aggregate completion drain in one acquisition attempt.
-    pub max_completions: u32,
-    /// Largest number of submissions withdrawn in one reclaim attempt.
-    pub max_submission_withdrawals: u32,
-    /// Largest active fan-out visited by one publication.
-    pub max_subscriber_visits: u32,
 }
 
 /// Maximum number of positions in one prepared complete-buffer rendezvous.
