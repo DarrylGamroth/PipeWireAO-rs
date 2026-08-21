@@ -1070,6 +1070,7 @@ bitflags! {
         const ALLOC_BUFFERS = pw_sys::pw_stream_flags_PW_STREAM_FLAG_ALLOC_BUFFERS;
         #[cfg(feature = "v0_3_41")]
         const TRIGGER = pw_sys::pw_stream_flags_PW_STREAM_FLAG_TRIGGER;
+        const BUFFER_LATEST = pw_sys::pw_stream_flags_PW_STREAM_FLAG_BUFFER_LATEST;
     }
 }
 
@@ -1082,6 +1083,14 @@ mod latest_tests {
         fn require_send<T: Send>() {}
 
         require_send::<StreamBufferLatest<'static>>();
+    }
+
+    #[test]
+    fn latest_stream_flag_uses_the_native_transport_bit() {
+        assert_eq!(
+            StreamFlags::BUFFER_LATEST.bits(),
+            pw_sys::pw_stream_flags_PW_STREAM_FLAG_BUFFER_LATEST
+        );
     }
 
     #[test]
