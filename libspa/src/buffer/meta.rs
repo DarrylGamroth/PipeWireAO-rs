@@ -604,8 +604,6 @@ pub const ACQUISITION_DOMAIN_SIZE: usize = spa_sys::SPA_META_ACQUISITION_DOMAIN_
 /// Number of bytes in an IEEE 1588 PTP clock identity.
 pub const ACQUISITION_PTP_CLOCK_ID_SIZE: usize =
     spa_sys::SPA_META_ACQUISITION_PTP_CLOCK_ID_SIZE as usize;
-/// Size of the canonical big-endian Version 2 wire record.
-pub const ACQUISITION_WIRE_SIZE: usize = spa_sys::SPA_META_ACQUISITION_WIRE_SIZE as usize;
 
 bitflags::bitflags! {
     /// Valid fields in [`MetaAcquisition`].
@@ -938,34 +936,6 @@ impl MetaAcquisition {
         }
     }
 
-    /// Encodes the canonical big-endian Version 2 wire record.
-    pub fn to_wire(&self) -> Result<[u8; ACQUISITION_WIRE_SIZE], AcquisitionMetaError> {
-        let mut wire = [0; ACQUISITION_WIRE_SIZE];
-        let valid = unsafe {
-            spa_sys::spa_meta_acquisition_serialize(
-                self.as_raw(),
-                wire.as_mut_ptr(),
-                wire.len() as u32,
-            )
-        };
-        valid.then_some(wire).ok_or(AcquisitionMetaError)
-    }
-
-    /// Decodes and validates a canonical big-endian Version 2 wire record.
-    pub fn from_wire(wire: &[u8; ACQUISITION_WIRE_SIZE]) -> Result<Self, AcquisitionMetaError> {
-        let mut raw = std::mem::MaybeUninit::<spa_sys::spa_meta_acquisition>::uninit();
-        let valid = unsafe {
-            spa_sys::spa_meta_acquisition_deserialize(
-                raw.as_mut_ptr(),
-                wire.as_ptr(),
-                wire.len() as u32,
-            )
-        };
-        valid
-            .then(|| Self(unsafe { raw.assume_init() }))
-            .ok_or(AcquisitionMetaError)
-    }
-
     /// Validates this allocation with the authoritative native helper.
     pub fn validate(&self) -> Result<(), AcquisitionMetaError> {
         let wrapper = spa_sys::spa_meta {
@@ -1121,12 +1091,6 @@ mod acquisition_tests {
         assert_eq!(first.time_difference(&second), Some((-44, 20)));
         assert!(!first.times_match(&second, 23));
         assert!(first.times_match(&second, 24));
-
-        let wire = first.to_wire().unwrap();
-        assert_eq!(&wire[0..4], &[0, 0, 0, 2]);
-        let decoded = MetaAcquisition::from_wire(&wire).unwrap();
-        assert_eq!(decoded.ptp_reference().unwrap(), Some(reference));
-        assert_eq!(decoded.time_difference(&first), Some((0, 18)));
 
         second
             .set_exposure_start_ptp(123_500, 11, AcquisitionPtpReference::new(grandmaster(2), 7))
