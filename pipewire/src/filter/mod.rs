@@ -22,7 +22,6 @@ use std::{
 mod box_;
 pub use box_::*;
 mod rc;
-pub use crate::buffer::BufferLatestStats;
 pub use rc::*;
 
 /// Current connection state of a filter.

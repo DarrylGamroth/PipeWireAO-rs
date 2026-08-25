@@ -6,7 +6,7 @@
 use std::{io::Cursor, mem::size_of};
 
 use crate::{
-    buffer::meta::{MetaAcquisition, MetaProgressive, Metadata},
+    buffer::meta::{MetaAcquisition, Metadata},
     pod::{serialize::PodSerializer, Object, Pod, Property, Value},
     utils::Id,
 };
@@ -63,24 +63,12 @@ impl Parameters {
         Err("parameters do not contain SPA_PARAM_Buffers")
     }
 
-    /// Requests PipeWireAO Version 1 progressive metadata on every buffer.
-    ///
-    /// The application metadata identifier is intentionally not placed in
-    /// `SPA_PARAM_BUFFERS_metaType`, whose mask cannot represent custom IDs.
-    pub fn with_progressive_meta(self) -> Self {
-        self.with_meta(
-            MetaProgressive::META_TYPE,
-            size_of::<MetaProgressive>(),
-            None,
-        )
-    }
-
-    /// Requests PipeWireAO Version 1 acquisition metadata on every buffer.
+    /// Requests the current PipeWireAO acquisition metadata on every buffer.
     pub fn with_acquisition_meta(self) -> Self {
         self.with_meta(
             MetaAcquisition::META_TYPE,
             size_of::<MetaAcquisition>(),
-            Some(spa_sys::SPA_META_FEATURE_ACQUISITION_VERSION_1 as i32),
+            Some(spa_sys::SPA_META_FEATURE_ACQUISITION_CURRENT as i32),
         )
     }
 
@@ -192,22 +180,6 @@ mod tests {
     }
 
     #[test]
-    fn progressive_metadata_request_has_no_features_property() {
-        let parameters = Parameters::new([]).with_progressive_meta();
-        let Value::Object(object) = value(&parameters, 0) else {
-            panic!("expected object");
-        };
-        assert!(object.properties.iter().any(|property| {
-            property.key == spa_sys::SPA_PARAM_META_type
-                && property.value == Value::Id(Id(MetaProgressive::META_TYPE))
-        }));
-        assert!(object
-            .properties
-            .iter()
-            .all(|property| property.key != spa_sys::SPA_PARAM_META_features));
-    }
-
-    #[test]
     fn acquisition_metadata_request_carries_version_feature() {
         let parameters = Parameters::new([]).with_acquisition_meta();
         let Value::Object(object) = value(&parameters, 0) else {
@@ -220,7 +192,7 @@ mod tests {
         assert!(object.properties.iter().any(|property| {
             property.key == spa_sys::SPA_PARAM_META_features
                 && property.value
-                    == Value::Int(spa_sys::SPA_META_FEATURE_ACQUISITION_VERSION_1 as i32)
+                    == Value::Int(spa_sys::SPA_META_FEATURE_ACQUISITION_CURRENT as i32)
         }));
     }
 }

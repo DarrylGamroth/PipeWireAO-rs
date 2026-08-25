@@ -5,18 +5,14 @@
 //!
 //! This module contains wrappers for [`pw_stream`](pw_sys::pw_stream) and related itmes.
 
-use crate::buffer::{Buffer, BufferLatestStats};
+use crate::buffer::Buffer;
 use crate::{error::Error, properties::Properties};
 use bitflags::bitflags;
 use spa::utils::result::SpaResult;
 use std::{
-    cell::Cell,
     ffi::{self, CStr, CString},
     fmt::Debug,
-    io,
-    marker::PhantomData,
     mem, os,
-    os::fd::BorrowedFd,
     pin::Pin,
     ptr,
 };
@@ -257,27 +253,6 @@ impl Stream {
         unsafe { Buffer::from_raw(self.dequeue_raw_buffer(), self) }
     }
 
-    /// Acquires exclusive graph-independent ownership of this stream's buffers.
-    ///
-    /// The returned handle bypasses graph process scheduling while preserving
-    /// PipeWireAO buffer negotiation, sharing, fanout, and lease accounting.
-    ///
-    /// # Safety
-    ///
-    /// No graph process callback or other thread may dequeue or queue buffers
-    /// on this stream while the handle exists. The worker must drop the handle
-    /// before stream disconnect or destruction. PipeWireAO rejects concurrent
-    /// workers, pool replacement, and disconnect while ownership is active.
-    pub unsafe fn buffer_latest(&self) -> Result<StreamBufferLatest<'_>, Error> {
-        let result = pw_sys::pw_stream_buffer_latest_worker_begin(self.as_raw_ptr());
-        SpaResult::from_c(result).into_result()?;
-        Ok(StreamBufferLatest {
-            stream: ptr::NonNull::new_unchecked(self.as_raw_ptr()),
-            lifetime: PhantomData,
-            not_sync: PhantomData,
-        })
-    }
-
     /// Return a Buffer to the Stream
     ///
     /// Give back a buffer once processing is complete. Use this to queue up a
@@ -426,95 +401,6 @@ impl Stream {
     // TODO: pw_stream_get_core()
     // TODO: pw_stream_get_nsec() (since PipeWire 1.1.0, needs v1_1 feature)
 }
-
-/// Exclusive worker-side access to one graph-independent latest-buffer stream.
-///
-/// Obtain this handle with [`Stream::buffer_latest`]. Dropping it releases the
-/// C worker-ownership barrier; all claimed buffers must be returned first.
-pub struct StreamBufferLatest<'s> {
-    stream: ptr::NonNull<pw_sys::pw_stream>,
-    lifetime: PhantomData<&'s Stream>,
-    not_sync: PhantomData<Cell<()>>,
-}
-
-impl StreamBufferLatest<'_> {
-    fn stream(&self) -> &Stream {
-        unsafe { self.stream.cast::<Stream>().as_ref() }
-    }
-
-    /// Takes a safely reusable output buffer.
-    ///
-    /// Dropping the returned buffer publishes it to the active subscriber set.
-    pub fn dequeue_output(&mut self) -> Option<Buffer<'_>> {
-        self.stream().dequeue_buffer()
-    }
-
-    /// Tries to claim one input publication without consulting ordinary queues.
-    ///
-    /// `Ok(None)` is the expected no-work result. The buffer exposes its
-    /// publisher-local transport sequence through [`Buffer::submission_sequence`].
-    pub fn try_dequeue_input(&mut self) -> io::Result<Option<Buffer<'_>>> {
-        let mut buffer = ptr::null_mut();
-        let mut submission_sequence = 0;
-        let result = unsafe {
-            pw_sys::pw_stream_try_dequeue_buffer_latest(
-                self.stream.as_ptr(),
-                &mut buffer,
-                &mut submission_sequence,
-            )
-        };
-        match result {
-            0 => Ok(None),
-            1 => ptr::NonNull::new(buffer)
-                .zip(std::num::NonZeroU64::new(submission_sequence))
-                .map(|(buffer, sequence)| unsafe {
-                    Buffer::from_stream_latest_raw(buffer, self.stream(), sequence)
-                })
-                .map(Some)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO)),
-            result if result < 0 => Err(io::Error::from_raw_os_error(-result)),
-            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-        }
-    }
-
-    /// Returns the borrowed advisory eventfd selected for this stream.
-    pub fn notification_fd(&self) -> io::Result<BorrowedFd<'_>> {
-        let result = unsafe { pw_sys::pw_stream_get_buffer_latest_fd(self.stream.as_ptr()) };
-        if result < 0 {
-            Err(io::Error::from_raw_os_error(-result))
-        } else {
-            Ok(unsafe { BorrowedFd::borrow_raw(result) })
-        }
-    }
-
-    /// Snapshots bounded producer-side acquisition accounting.
-    pub fn stats(&self) -> io::Result<BufferLatestStats> {
-        let mut raw = std::mem::MaybeUninit::<pw_sys::pw_buffer_latest_stats>::uninit();
-        let result = unsafe {
-            pw_sys::pw_stream_get_buffer_latest_stats(
-                self.stream.as_ptr(),
-                raw.as_mut_ptr(),
-                std::mem::size_of::<pw_sys::pw_buffer_latest_stats>(),
-            )
-        };
-        if result < 0 {
-            Err(io::Error::from_raw_os_error(-result))
-        } else {
-            Ok(unsafe { raw.assume_init() }.into())
-        }
-    }
-}
-
-impl Drop for StreamBufferLatest<'_> {
-    fn drop(&mut self) {
-        let result = unsafe { pw_sys::pw_stream_buffer_latest_worker_end(self.stream.as_ptr()) };
-        debug_assert_eq!(result, 0, "latest-buffer stream ownership ended twice");
-    }
-}
-
-// SAFETY: construction requires exclusive stream access and an explicit
-// promise that one worker owns all buffer operations until this guard drops.
-unsafe impl Send for StreamBufferLatest<'_> {}
 
 type ParamChangedCB<D> = dyn FnMut(&Stream, &mut D, u32, Option<&spa::pod::Pod>);
 type ProcessCB<D> = dyn FnMut(&Stream, &mut D);
@@ -1070,41 +956,5 @@ bitflags! {
         const ALLOC_BUFFERS = pw_sys::pw_stream_flags_PW_STREAM_FLAG_ALLOC_BUFFERS;
         #[cfg(feature = "v0_3_41")]
         const TRIGGER = pw_sys::pw_stream_flags_PW_STREAM_FLAG_TRIGGER;
-        const BUFFER_LATEST = pw_sys::pw_stream_flags_PW_STREAM_FLAG_BUFFER_LATEST;
-    }
-}
-
-#[cfg(test)]
-mod latest_tests {
-    use super::*;
-
-    #[test]
-    fn latest_worker_handle_can_move_to_its_exclusive_worker() {
-        fn require_send<T: Send>() {}
-
-        require_send::<StreamBufferLatest<'static>>();
-    }
-
-    #[test]
-    fn latest_stream_flag_uses_the_native_transport_bit() {
-        assert_eq!(
-            StreamFlags::BUFFER_LATEST.bits(),
-            pw_sys::pw_stream_flags_PW_STREAM_FLAG_BUFFER_LATEST
-        );
-    }
-
-    #[test]
-    fn latest_stats_decode_shared_core_accounting() {
-        let raw = pw_sys::pw_buffer_latest_stats {
-            publications: 17,
-            subscriber_deliveries: 31,
-            max_subscriber_visits: 4,
-            ..unsafe { std::mem::zeroed() }
-        };
-
-        let stats = BufferLatestStats::from(raw);
-        assert_eq!(stats.publications, 17);
-        assert_eq!(stats.subscriber_deliveries, 31);
-        assert_eq!(stats.max_subscriber_visits, 4);
     }
 }

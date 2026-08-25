@@ -1,8 +1,8 @@
 # PipeWireAO-rs
 
 Rust bindings for the collision-free PipeWireAO and SPA libraries. This fork
-contains the exclusive latest-buffer and progressive-lease APIs used by the AO
-runtime. The published package identities are `pipewire-ao`,
+adds ndarray formats, acquisition metadata, and owned filter helpers used by
+the AO runtime. The published package identities are `pipewire-ao`,
 `pipewire-ao-sys`, `libspa-ao`, and `libspa-ao-sys`; they do not replace the
 upstream Rust packages.
 
