@@ -396,31 +396,47 @@ fn property_value(
     Ok(value)
 }
 
+fn fixed_id(value: &Value) -> Option<u32> {
+    match value {
+        Value::Id(Id(value))
+        | Value::Choice(ChoiceValue::Id(Choice(_, ChoiceEnum::None(Id(value))))) => Some(*value),
+        _ => None,
+    }
+}
+
+fn fixed_fraction(value: &Value) -> Option<Fraction> {
+    match value {
+        Value::Fraction(value)
+        | Value::Choice(ChoiceValue::Fraction(Choice(_, ChoiceEnum::None(value)))) => Some(*value),
+        _ => None,
+    }
+}
+
 impl NdArrayFormat<Vec<u32>> {
     /// Parse a fixed native ndarray format while ignoring application properties.
     pub fn from_properties(properties: &[Property]) -> Result<Self, NdArrayFormatError> {
         let media_type = property_value(properties, FormatProperties::MediaType, true)?;
-        if media_type != Some(&Value::Id(Id(MediaType::Application.as_raw()))) {
+        if media_type.and_then(fixed_id) != Some(MediaType::Application.as_raw()) {
             return Err(NdArrayFormatError::InvalidProperty(
                 FormatProperties::MediaType,
             ));
         }
         let media_subtype = property_value(properties, FormatProperties::MediaSubtype, true)?;
-        if media_subtype != Some(&Value::Id(Id(MediaSubtype::NdArray.as_raw()))) {
+        if media_subtype.and_then(fixed_id) != Some(MediaSubtype::NdArray.as_raw()) {
             return Err(NdArrayFormatError::InvalidProperty(
                 FormatProperties::MediaSubtype,
             ));
         }
 
-        let element_type =
-            match property_value(properties, FormatProperties::NdArrayElementType, true)? {
-                Some(Value::Id(Id(raw))) => ElementType::from_raw(*raw),
-                _ => {
-                    return Err(NdArrayFormatError::InvalidProperty(
-                        FormatProperties::NdArrayElementType,
-                    ));
-                }
-            };
+        let Some(element_type) =
+            property_value(properties, FormatProperties::NdArrayElementType, true)?
+                .and_then(fixed_id)
+                .map(ElementType::from_raw)
+        else {
+            return Err(NdArrayFormatError::InvalidProperty(
+                FormatProperties::NdArrayElementType,
+            ));
+        };
         let shape = match property_value(properties, FormatProperties::NdArrayShape, true)? {
             Some(Value::ValueArray(ValueArray::Int(shape))) => shape
                 .iter()
@@ -436,21 +452,18 @@ impl NdArrayFormat<Vec<u32>> {
                 ));
             }
         };
-        let layout = match property_value(properties, FormatProperties::NdArrayLayout, true)? {
-            Some(Value::Id(Id(raw))) => NdArrayLayout::from_raw(*raw),
-            _ => {
-                return Err(NdArrayFormatError::InvalidProperty(
-                    FormatProperties::NdArrayLayout,
-                ));
-            }
+        let Some(layout) = property_value(properties, FormatProperties::NdArrayLayout, true)?
+            .and_then(fixed_id)
+            .map(NdArrayLayout::from_raw)
+        else {
+            return Err(NdArrayFormatError::InvalidProperty(
+                FormatProperties::NdArrayLayout,
+            ));
         };
         let rate = match property_value(properties, FormatProperties::NdArrayRate, false)? {
-            Some(Value::Fraction(rate)) => Some(*rate),
-            Some(_) => {
-                return Err(NdArrayFormatError::InvalidProperty(
-                    FormatProperties::NdArrayRate,
-                ));
-            }
+            Some(value) => Some(fixed_fraction(value).ok_or(
+                NdArrayFormatError::InvalidProperty(FormatProperties::NdArrayRate),
+            )?),
             None => None,
         };
         Self::new(element_type, shape, layout, rate)
@@ -1249,6 +1262,37 @@ mod tests {
                 actual: 2,
             })
         );
+    }
+
+    #[test]
+    fn fixed_ndarray_parser_accepts_singleton_choices_from_negotiation() {
+        let matrix = MatrixFormat::new(
+            ElementType::F32Le,
+            480,
+            640,
+            NdArrayLayout::RowMajor,
+            Some(Fraction { num: 30, denom: 1 }),
+        )
+        .unwrap();
+        let mut properties = matrix.properties();
+        for index in [0, 1, 2, 4] {
+            let Value::Id(value) = properties[index].value.clone() else {
+                unreachable!("selected ndarray property is an ID");
+            };
+            properties[index].value = Value::Choice(ChoiceValue::Id(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::None(value),
+            )));
+        }
+        let Value::Fraction(rate) = properties[5].value.clone() else {
+            unreachable!("selected ndarray property is a fraction");
+        };
+        properties[5].value = Value::Choice(ChoiceValue::Fraction(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::None(rate),
+        )));
+
+        assert_eq!(MatrixFormat::from_properties(&properties), Ok(matrix));
     }
 
     #[test]
