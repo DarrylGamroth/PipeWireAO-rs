@@ -150,6 +150,7 @@ pub mod factory;
 pub mod filter;
 pub mod keys;
 pub mod link;
+pub mod local_module;
 pub mod loop_;
 pub mod main_loop;
 pub mod metadata;

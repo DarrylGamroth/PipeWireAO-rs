@@ -1,4 +1,5 @@
 #include <pipewire/pipewire.h>
+#include <pipewire/impl-module.h>
 #include <pipewire/extensions/client-node.h>
 #include <pipewire/extensions/metadata.h>
 #include <pipewire/extensions/profiler.h>
