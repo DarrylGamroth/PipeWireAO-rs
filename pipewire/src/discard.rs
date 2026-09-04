@@ -8,6 +8,8 @@ pub enum DiscardMetric {
     Bytes,
     ProtocolErrors,
     ProcessCalls,
+    PayloadDigest,
+    DigestBytes,
 }
 
 impl DiscardMetric {
@@ -22,6 +24,8 @@ impl DiscardMetric {
             Self::Bytes => first + 2,
             Self::ProtocolErrors => first + 3,
             Self::ProcessCalls => first + 4,
+            Self::PayloadDigest => first + 5,
+            Self::DigestBytes => first + 6,
         }
     }
 
@@ -34,6 +38,8 @@ impl DiscardMetric {
             Self::Bytes => "discard.bytes",
             Self::ProtocolErrors => "discard.protocol-errors",
             Self::ProcessCalls => "discard.process-calls",
+            Self::PayloadDigest => "discard.payload-digest",
+            Self::DigestBytes => "discard.digest-bytes",
         }
     }
 }
@@ -50,6 +56,8 @@ mod tests {
             DiscardMetric::Bytes,
             DiscardMetric::ProtocolErrors,
             DiscardMetric::ProcessCalls,
+            DiscardMetric::PayloadDigest,
+            DiscardMetric::DigestBytes,
         ];
         for (offset, metric) in metrics.into_iter().enumerate() {
             assert_eq!(
