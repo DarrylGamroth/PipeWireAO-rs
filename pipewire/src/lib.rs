@@ -163,6 +163,7 @@ pub mod port;
 pub mod properties;
 pub mod proxy;
 pub mod registry;
+pub mod reset_control;
 pub mod run_control;
 pub mod stream;
 pub mod thread_loop;
