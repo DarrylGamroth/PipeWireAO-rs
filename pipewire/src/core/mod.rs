@@ -8,6 +8,7 @@
 use bitflags::bitflags;
 use libc::{c_char, c_void};
 use std::{
+    borrow::Cow,
     ffi::{CStr, CString},
     fmt, mem,
     pin::Pin,
@@ -367,8 +368,12 @@ impl<'a> ListenerLocalBuilder<'a> {
             message: *const c_char,
         ) {
             let callbacks = (data as *mut ListenerLocalCallbacks).as_ref().unwrap();
-            let message = CStr::from_ptr(message).to_str().unwrap();
-            callbacks.error.as_ref().unwrap()(id, seq, res, message);
+            let message = if message.is_null() {
+                Cow::Borrowed("")
+            } else {
+                CStr::from_ptr(message).to_string_lossy()
+            };
+            callbacks.error.as_ref().unwrap()(id, seq, res, &message);
         }
 
         let e = unsafe {
