@@ -29,6 +29,16 @@ enum BufferOwner<'a> {
 }
 
 impl<'s> Buffer<'s> {
+    /// Returns the native buffer pointer while this buffer owns its lease.
+    ///
+    /// The pointer and its borrowed SPA metadata are valid only until this
+    /// buffer is dropped or its lease is otherwise returned. Access must obey
+    /// Rust's aliasing rules. Do not return this pointer to the stream or filter
+    /// yourself: dropping this buffer returns the lease exactly once.
+    pub fn as_raw_ptr(&self) -> *mut pw_sys::pw_buffer {
+        self.buf.as_ptr()
+    }
+
     pub(crate) unsafe fn from_raw(
         buf: *mut pw_sys::pw_buffer,
         stream: &Stream,
@@ -225,5 +235,32 @@ impl Drop for Buffer<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::ManuallyDrop;
+
+    #[test]
+    fn raw_accessor_preserves_the_owned_buffer() {
+        let mut spa_buffer: spa_sys::spa_buffer = unsafe { std::mem::zeroed() };
+        let mut raw: pw_sys::pw_buffer = unsafe { std::mem::zeroed() };
+        raw.buffer = &mut spa_buffer;
+        let expected = std::ptr::from_mut(&mut raw);
+        // This local allocation is not a native lease. Suppress Drop so the
+        // fixture never submits its dummy port to native queue operations.
+        let buffer = ManuallyDrop::new(Buffer {
+            buf: NonNull::new(expected).unwrap(),
+            owner: BufferOwner::FilterPort(NonNull::dangling(), PhantomData),
+        });
+        assert_eq!(buffer.as_raw_ptr(), expected);
+        assert_eq!(buffer.as_raw_ptr(), expected);
+        assert_eq!(
+            unsafe { (*buffer.as_raw_ptr()).buffer },
+            &mut spa_buffer as *mut _
+        );
+        assert!(matches!(&buffer.owner, BufferOwner::FilterPort(_, _)));
     }
 }
