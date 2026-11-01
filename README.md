@@ -36,8 +36,15 @@ storage borrow. The native contract limits allocations to 4096 bytes and 64 fiel
 
 `optical_classification()` returns absent, unfringed, fringed or mixed content,
 independently of Acquisition v3 electrical trigger state. `None` means the property
-is missing, distinct from explicit absent/mixed. Header and Acquisition retain their
-existing APIs. This extension requires native PipeWireAO BufferProperties V1 headers;
+is missing, distinct from explicit absent/mixed. `trigger_classification()` uses
+the existing native Acquisition trigger enum
+(absent/low/high/mixed), without inferring any optical content. The safe
+`MetaAcquisition::trigger_classification()` accessor exposes that same enum for
+v3 and returns no classification for v1/v2. `acquisition_is_consistent()` rejects
+a disagreement between a present typed trigger and Acquisition v3, including
+records without identity; v1/v2 permit a separately declared typed trigger.
+Header and Acquisition retain their existing ABI and APIs. This extension requires
+native PipeWireAO BufferProperties V1 headers;
 Cargo's existing bindgen build regenerates native bindings automatically.
 
 Focused verification against the source build uses

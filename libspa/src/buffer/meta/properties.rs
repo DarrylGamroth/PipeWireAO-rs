@@ -84,6 +84,36 @@ impl<'a> BufferProperties<'a> {
         (!value.is_null()).then(|| unsafe { Pod::from_raw(value) })
     }
 
+    /// Electrical trigger classification, using the existing Acquisition trigger enum.
+    /// Missing key differs from explicit absent or mixed classification.
+    pub fn trigger_classification(
+        &self,
+    ) -> Option<spa_sys::spa_meta_acquisition_trigger_classification> {
+        self.get(spa_sys::SPA_META_PROPERTY_triggerClassification)
+            .map(|value| {
+                value
+                    .get_id()
+                    .expect("native trigger classification is an Id")
+                    .0
+            })
+    }
+
+    /// Require equal electrical classifications when Properties and Acquisition v3 both supply one.
+    /// Acquisition v1/v2 may coexist with the new trigger property without supplying a duplicate.
+    pub fn acquisition_is_consistent(&self, acquisition: Option<&super::MetaAcquisition>) -> bool {
+        let raw = acquisition.map(|value| spa_sys::spa_meta {
+            type_: spa_sys::SPA_META_Acquisition,
+            size: std::mem::size_of::<spa_sys::spa_meta_acquisition>() as u32,
+            data: std::ptr::from_ref(value.as_raw()).cast_mut().cast(),
+        });
+        unsafe {
+            spa_sys::spa_meta_properties_acquisition_is_consistent(
+                &self.raw,
+                raw.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+            )
+        }
+    }
+
     /// Distinguish no optical property from explicit absent or mixed content.
     pub fn optical_classification(&self) -> Option<OpticalClassification> {
         let value = self.get(spa_sys::SPA_META_PROPERTY_opticalClassification)?;
@@ -104,7 +134,7 @@ impl<'a> BufferProperties<'a> {
 mod tests {
     use super::*;
 
-    fn storage(optical: Option<u32>) -> [u64; 16] {
+    fn storage(optical: Option<u32>, trigger: Option<u32>) -> [u64; 16] {
         let mut words = [0u64; 16];
         let mut raw = spa_sys::spa_meta {
             type_: spa_sys::SPA_META_Properties,
@@ -117,6 +147,17 @@ mod tests {
                 spa_sys::spa_meta_properties_add(
                     &mut raw,
                     spa_sys::SPA_META_PROPERTY_opticalClassification,
+                    spa_sys::SPA_TYPE_Id,
+                    4,
+                    std::ptr::from_ref(&value).cast(),
+                )
+            });
+        }
+        if let Some(value) = trigger {
+            assert!(unsafe {
+                spa_sys::spa_meta_properties_add(
+                    &mut raw,
+                    spa_sys::SPA_META_PROPERTY_triggerClassification,
                     spa_sys::SPA_TYPE_Id,
                     4,
                     std::ptr::from_ref(&value).cast(),
@@ -152,7 +193,7 @@ mod tests {
             (2, OpticalClassification::Fringed),
             (3, OpticalClassification::Mixed),
         ] {
-            let words = storage(Some(raw));
+            let words = storage(Some(raw), None);
             let properties = BufferProperties::from_bytes(bytes(&words), &[]).unwrap();
             assert_eq!(properties.optical_classification(), Some(expected));
             assert_eq!(properties.get(123).unwrap().get_int().unwrap(), 17);
@@ -166,7 +207,7 @@ mod tests {
             spa_sys::SPA_META_PROPERTY_opticalClassification,
             spa_sys::SPA_TYPE_Id,
         )];
-        let words = storage(None);
+        let words = storage(None, None);
         assert!(BufferProperties::from_bytes(bytes(&words), &required).is_err());
         assert_eq!(
             BufferProperties::from_bytes(bytes(&words), &[])
@@ -174,7 +215,7 @@ mod tests {
                 .optical_classification(),
             None
         );
-        let words = storage(Some(2));
+        let words = storage(Some(2), None);
         assert!(BufferProperties::from_bytes(bytes(&words), &required).is_ok());
         let wrong = [BufferPropertyRequirement::new(
             spa_sys::SPA_META_PROPERTY_opticalClassification,
@@ -185,7 +226,7 @@ mod tests {
 
     #[test]
     fn unknown_mandatory_property_needs_explicit_required_type() {
-        let mut words = storage(Some(2));
+        let mut words = storage(Some(2), None);
         words[5] |= (spa_sys::SPA_POD_PROP_FLAG_MANDATORY as u64) << 32;
         assert!(BufferProperties::from_bytes(bytes(&words), &[]).is_err());
         let requirements = [BufferPropertyRequirement::new(123, spa_sys::SPA_TYPE_Int)];
@@ -194,8 +235,66 @@ mod tests {
     }
 
     #[test]
+    fn trigger_properties_migrate_acquisition_v3_without_coupling_optical_content() {
+        for trigger in 0..=3 {
+            let words = storage(Some(spa_sys::SPA_META_OPTICAL_FRINGED), Some(trigger));
+            let properties = BufferProperties::from_bytes(bytes(&words), &[]).unwrap();
+            assert_eq!(properties.trigger_classification(), Some(trigger));
+            assert_eq!(
+                properties.optical_classification(),
+                Some(OpticalClassification::Fringed)
+            );
+            assert!(properties.acquisition_is_consistent(None));
+            let mut acquisition = super::super::MetaAcquisition::new();
+            assert_eq!(acquisition.trigger_classification().unwrap(), None);
+            assert!(properties.acquisition_is_consistent(Some(&acquisition)));
+            for duplicate in 0..=3 {
+                assert!(unsafe {
+                    spa_sys::spa_meta_acquisition_set_trigger_classification(
+                        acquisition.as_raw_mut(),
+                        duplicate,
+                    )
+                });
+                assert_eq!(
+                    acquisition.trigger_classification().unwrap(),
+                    Some(duplicate)
+                );
+                assert_eq!(
+                    properties.acquisition_is_consistent(Some(&acquisition)),
+                    trigger == duplicate
+                );
+            }
+        }
+        let words = storage(None, Some(spa_sys::SPA_META_ACQUISITION_TRIGGER_LOW));
+        let wrong_type = [BufferPropertyRequirement::new(
+            spa_sys::SPA_META_PROPERTY_triggerClassification,
+            spa_sys::SPA_TYPE_Int,
+        )];
+        assert!(BufferProperties::from_bytes(bytes(&words), &wrong_type).is_err());
+        let mut invalid = words;
+        invalid[4] = 4;
+        assert!(BufferProperties::from_bytes(bytes(&invalid), &[]).is_err());
+        let words = storage(None, None);
+        let properties = BufferProperties::from_bytes(bytes(&words), &[]).unwrap();
+        assert_eq!(properties.trigger_classification(), None);
+        let required = [BufferPropertyRequirement::new(
+            spa_sys::SPA_META_PROPERTY_triggerClassification,
+            spa_sys::SPA_TYPE_Id,
+        )];
+        assert!(BufferProperties::from_bytes(bytes(&words), &required).is_err());
+        let mut acquisition = super::super::MetaAcquisition::new();
+        assert!(unsafe {
+            spa_sys::spa_meta_acquisition_set_trigger_classification(
+                acquisition.as_raw_mut(),
+                spa_sys::SPA_META_ACQUISITION_TRIGGER_HIGH,
+            )
+        });
+        assert!(properties.acquisition_is_consistent(Some(&acquisition)));
+    }
+
+    #[test]
     fn malformed_size_alignment_padding_and_scalar_are_rejected() {
-        let mut words = storage(Some(2));
+        let mut words = storage(Some(2), None);
         assert!(BufferProperties::from_bytes(&bytes(&words)[1..], &[]).is_err());
         assert!(BufferProperties::from_bytes(&bytes(&words)[..15], &[]).is_err());
         words[4] = 99; // optical Id body and its padding

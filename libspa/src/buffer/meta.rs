@@ -768,6 +768,16 @@ impl MetaAcquisition {
         );
     }
 
+    /// Electrical trigger classification from validated Acquisition v3; older versions have none.
+    pub fn trigger_classification(
+        &self,
+    ) -> Result<Option<spa_sys::spa_meta_acquisition_trigger_classification>, AcquisitionMetaError>
+    {
+        self.validate()?;
+        Ok((self.version() == spa_sys::SPA_META_ACQUISITION_VERSION_3)
+            .then_some(self.0.reserved2 as u32))
+    }
+
     pub fn as_raw(&self) -> &spa_sys::spa_meta_acquisition {
         &self.0
     }
