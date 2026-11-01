@@ -25,6 +25,26 @@ The build probes only the AO pkg-config names and intentionally fails when only
 upstream PipeWire is installed. For an uninstalled sibling PipeWireAO build,
 run Cargo through its Meson development environment.
 
+## Per-buffer properties
+
+`libspa::buffer::meta::BufferProperties::from_bytes` borrows the buffer's aligned
+Properties allocation and uses the native bounded validator before exposing typed
+POD values. `BufferPropertyRequirement::new(key, type)` makes missing or mistyped
+keys fail validation. Unknown optional typed keys may be skipped; unknown mandatory
+keys require a matching consumer requirement. Borrowed values cannot outlive the
+storage borrow. The native contract limits allocations to 4096 bytes and 64 fields.
+
+`optical_classification()` returns absent, unfringed, fringed or mixed content,
+independently of Acquisition v3 electrical trigger state. `None` means the property
+is missing, distinct from explicit absent/mixed. Header and Acquisition retain their
+existing APIs. This extension requires native PipeWireAO BufferProperties V1 headers;
+Cargo's existing bindgen build regenerates native bindings automatically.
+
+Focused verification against the source build uses
+`cargo test -p libspa-ao --lib buffer::meta` with the native build's absolute
+`PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`. This checks software metadata handling,
+not physical acquisition or deadline performance.
+
 ## License
 PipeWireAO-rs is distributed under the terms of the MIT license.
 

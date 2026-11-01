@@ -150,6 +150,8 @@ impl SpaTypes {
     pub const ObjectParamFormat: Self = Self(spa_sys::SPA_TYPE_OBJECT_Format);
     pub const ObjectParamBuffers: Self = Self(spa_sys::SPA_TYPE_OBJECT_ParamBuffers);
     pub const ObjectParamMeta: Self = Self(spa_sys::SPA_TYPE_OBJECT_ParamMeta);
+    /// Bounded, versioned typed per-buffer properties.
+    pub const ObjectBufferProperties: Self = Self(spa_sys::SPA_TYPE_OBJECT_BufferProperties);
     pub const ObjectParamIO: Self = Self(spa_sys::SPA_TYPE_OBJECT_ParamIO);
     pub const ObjectParamProfile: Self = Self(spa_sys::SPA_TYPE_OBJECT_ParamProfile);
     pub const ObjectParamPortConfig: Self = Self(spa_sys::SPA_TYPE_OBJECT_ParamPortConfig);

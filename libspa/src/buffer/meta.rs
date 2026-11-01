@@ -3,6 +3,11 @@
 
 //! Buffer metadata
 
+mod properties;
+pub use properties::{
+    BufferProperties, BufferPropertiesError, BufferPropertyRequirement, OpticalClassification,
+};
+
 use crate::param::video::VideoFormat;
 use crate::utils::{Point, Rectangle, Region};
 
