@@ -5,7 +5,8 @@
 
 mod properties;
 pub use properties::{
-    BufferProperties, BufferPropertiesError, BufferPropertyRequirement, OpticalClassification,
+    BufferProperties, BufferPropertiesBuilder, BufferPropertiesError, BufferPropertyRequirement,
+    OpticalClassification,
 };
 
 use crate::param::video::VideoFormat;
@@ -605,24 +606,9 @@ impl Metadata for MetaSyncTimeline {
 }
 
 /// Number of bytes in a PipeWireAO acquisition-domain identifier.
-pub const ACQUISITION_DOMAIN_SIZE: usize = spa_sys::SPA_META_ACQUISITION_DOMAIN_SIZE as usize;
+pub const ACQUISITION_DOMAIN_SIZE: usize = spa_sys::SPA_ACQUISITION_DOMAIN_SIZE as usize;
 /// Number of bytes in an IEEE 1588 PTP clock identity.
-pub const ACQUISITION_PTP_CLOCK_ID_SIZE: usize =
-    spa_sys::SPA_META_ACQUISITION_PTP_CLOCK_ID_SIZE as usize;
-
-bitflags::bitflags! {
-    /// Valid fields in [`MetaAcquisition`].
-    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    pub struct AcquisitionFlags: u32 {
-        const IDENTITY_VALID = spa_sys::SPA_META_ACQUISITION_FLAG_IDENTITY_VALID;
-        const EXPOSURE_START_VALID =
-            spa_sys::SPA_META_ACQUISITION_FLAG_EXPOSURE_START_VALID;
-        const EXPOSURE_DURATION_VALID =
-            spa_sys::SPA_META_ACQUISITION_FLAG_EXPOSURE_DURATION_VALID;
-        const PTP_REFERENCE_VALID =
-            spa_sys::SPA_META_ACQUISITION_FLAG_PTP_REFERENCE_VALID;
-    }
-}
+pub const ACQUISITION_PTP_CLOCK_ID_SIZE: usize = spa_sys::SPA_EXPOSURE_PTP_CLOCK_ID_SIZE as usize;
 
 /// The clock domain used for an acquisition exposure timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -723,7 +709,7 @@ impl AcquisitionIdentity {
     }
 }
 
-/// A mapped acquisition metadata allocation violates the native Version 1 or 2 ABI.
+/// An acquisition fact violates the semantic contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcquisitionMetaError;
 
@@ -735,419 +721,76 @@ impl std::fmt::Display for AcquisitionMetaError {
 
 impl std::error::Error for AcquisitionMetaError {}
 
-/// Versioned acquisition identity and qualified exposure time.
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct MetaAcquisition(spa_sys::spa_meta_acquisition);
+/// Owned physical exposure start and its qualified clock authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExposureStart {
+    nanoseconds: i64,
+    uncertainty: u64,
+    ptp: Option<AcquisitionPtpReference>,
+}
 
-impl MetaAcquisition {
-    /// Creates valid metadata with no identity or exposure time established.
-    pub fn new() -> Self {
-        let mut raw = std::mem::MaybeUninit::<spa_sys::spa_meta_acquisition>::uninit();
-        let initialized = unsafe { spa_sys::spa_meta_acquisition_init(raw.as_mut_ptr()) };
-        assert!(
-            initialized,
-            "aligned Rust acquisition metadata failed to initialize"
-        );
-        Self(unsafe { raw.assume_init() })
-    }
-
-    /// Validates and wraps a native Version 1 or Version 2 metadata value.
-    pub fn from_raw(raw: spa_sys::spa_meta_acquisition) -> Result<Self, AcquisitionMetaError> {
-        let acquisition = Self(raw);
-        acquisition.validate()?;
-        Ok(acquisition)
-    }
-
-    /// Clears reusable metadata to its valid, empty current-version state.
-    pub fn initialize(&mut self) {
-        let initialized = unsafe { spa_sys::spa_meta_acquisition_init(self.as_raw_mut()) };
-        assert!(
-            initialized,
-            "aligned Rust acquisition metadata failed to initialize"
-        );
-    }
-
-    /// Electrical trigger classification from validated Acquisition v3; older versions have none.
-    pub fn trigger_classification(
-        &self,
-    ) -> Result<Option<spa_sys::spa_meta_acquisition_trigger_classification>, AcquisitionMetaError>
-    {
-        self.validate()?;
-        Ok((self.version() == spa_sys::SPA_META_ACQUISITION_VERSION_3)
-            .then_some(self.0.reserved2 as u32))
-    }
-
-    pub fn as_raw(&self) -> &spa_sys::spa_meta_acquisition {
-        &self.0
-    }
-
-    pub fn as_raw_mut(&mut self) -> &mut spa_sys::spa_meta_acquisition {
-        &mut self.0
-    }
-
-    pub fn version(&self) -> u32 {
-        self.0.version
-    }
-
-    pub fn abi_size(&self) -> u32 {
-        self.0.abi_size
-    }
-
-    pub fn flags(&self) -> Result<AcquisitionFlags, AcquisitionMetaError> {
-        self.validate()?;
-        AcquisitionFlags::from_bits(self.0.flags).ok_or(AcquisitionMetaError)
-    }
-
-    pub fn set_identity(
-        &mut self,
-        identity: AcquisitionIdentity,
-    ) -> Result<(), AcquisitionMetaError> {
-        let valid = unsafe {
-            spa_sys::spa_meta_acquisition_set_identity(
-                self.as_raw_mut(),
-                identity.domain.as_bytes().as_ptr(),
-                identity.generation,
-                identity.sequence,
-            )
-        };
-        valid.then_some(()).ok_or(AcquisitionMetaError)
-    }
-
-    pub fn identity(&self) -> Result<Option<AcquisitionIdentity>, AcquisitionMetaError> {
-        let flags = self.flags()?;
-        if !flags.contains(AcquisitionFlags::IDENTITY_VALID) {
-            return Ok(None);
-        }
-        Ok(Some(AcquisitionIdentity::new(
-            AcquisitionDomain(self.0.domain),
-            self.0.generation,
-            self.0.sequence,
-        )))
-    }
-
-    /// Sets exposure start in the local Linux `CLOCK_MONOTONIC` domain.
-    pub fn set_exposure_start(
-        &mut self,
+impl ExposureStart {
+    pub fn new(
         nanoseconds: i64,
-        uncertainty_nanoseconds: u64,
-    ) -> Result<(), AcquisitionMetaError> {
-        let valid = unsafe {
-            spa_sys::spa_meta_acquisition_set_exposure_start(
-                self.as_raw_mut(),
-                nanoseconds,
-                uncertainty_nanoseconds,
-            )
-        };
-        valid.then_some(()).ok_or(AcquisitionMetaError)
-    }
-
-    /// Returns exposure start and its inclusive uncertainty bound.
-    pub fn exposure_start(&self) -> Result<Option<(i64, u64)>, AcquisitionMetaError> {
-        let flags = self.flags()?;
-        Ok(flags
-            .contains(AcquisitionFlags::EXPOSURE_START_VALID)
-            .then_some((
-                self.0.exposure_start_nsec,
-                self.0.timestamp_uncertainty_nsec,
-            )))
-    }
-
-    /// Returns the timestamp clock domain, if exposure start is valid.
-    pub fn exposure_timebase(&self) -> Result<Option<AcquisitionTimebase>, AcquisitionMetaError> {
-        let flags = self.flags()?;
-        if !flags.contains(AcquisitionFlags::EXPOSURE_START_VALID) {
-            return Ok(None);
+        uncertainty: u64,
+        ptp: Option<AcquisitionPtpReference>,
+    ) -> Result<Self, AcquisitionMetaError> {
+        if nanoseconds < 0 {
+            return Err(AcquisitionMetaError);
         }
-        if self.version() == spa_sys::SPA_META_ACQUISITION_VERSION_1 {
-            return Ok(Some(AcquisitionTimebase::Monotonic));
-        }
-        match self.0.timebase {
-            spa_sys::SPA_META_ACQUISITION_TIMEBASE_MONOTONIC => {
-                Ok(Some(AcquisitionTimebase::Monotonic))
-            }
-            spa_sys::SPA_META_ACQUISITION_TIMEBASE_TAI => Ok(Some(AcquisitionTimebase::Tai)),
-            _ => Err(AcquisitionMetaError),
+        Ok(Self {
+            nanoseconds,
+            uncertainty,
+            ptp,
+        })
+    }
+    pub const fn nanoseconds(self) -> i64 {
+        self.nanoseconds
+    }
+    pub const fn uncertainty(self) -> u64 {
+        self.uncertainty
+    }
+    pub const fn ptp_reference(self) -> Option<AcquisitionPtpReference> {
+        self.ptp
+    }
+    pub const fn timebase(self) -> AcquisitionTimebase {
+        if self.ptp.is_some() {
+            AcquisitionTimebase::Tai
+        } else {
+            AcquisitionTimebase::Monotonic
         }
     }
-
-    /// Sets a PTP-qualified exposure start in Linux `CLOCK_TAI` nanoseconds.
-    pub fn set_exposure_start_ptp(
-        &mut self,
-        nanoseconds: i64,
-        uncertainty_nanoseconds: u64,
-        reference: AcquisitionPtpReference,
-    ) -> Result<(), AcquisitionMetaError> {
-        let valid = unsafe {
-            spa_sys::spa_meta_acquisition_set_exposure_start_ptp(
-                self.as_raw_mut(),
-                nanoseconds,
-                uncertainty_nanoseconds,
-                reference.grandmaster.as_bytes().as_ptr(),
-                reference.domain_number,
-            )
-        };
-        valid.then_some(()).ok_or(AcquisitionMetaError)
-    }
-
-    /// Returns the PTP authority for a cross-host-comparable timestamp.
-    pub fn ptp_reference(&self) -> Result<Option<AcquisitionPtpReference>, AcquisitionMetaError> {
-        let flags = self.flags()?;
-        if !flags.contains(AcquisitionFlags::PTP_REFERENCE_VALID) {
-            return Ok(None);
+    fn as_raw(self) -> spa_sys::spa_exposure_start {
+        spa_sys::spa_exposure_start {
+            nsec: self.nanoseconds,
+            uncertainty_nsec: self.uncertainty,
+            timebase: if self.ptp.is_some() {
+                spa_sys::SPA_EXPOSURE_TIMEBASE_TAI
+            } else {
+                spa_sys::SPA_EXPOSURE_TIMEBASE_MONOTONIC
+            },
+            ptp_grandmaster_identity: self.ptp.map_or([0; ACQUISITION_PTP_CLOCK_ID_SIZE], |p| {
+                *p.grandmaster().as_bytes()
+            }),
+            ptp_domain_number: self.ptp.map_or(0, |p| p.domain_number()),
         }
-        let grandmaster = PtpClockIdentity::new(self.0.ptp_grandmaster_id)?;
-        Ok(Some(AcquisitionPtpReference::new(
-            grandmaster,
-            self.0.ptp_domain_number,
-        )))
     }
-
-    pub fn set_exposure_duration(&mut self, nanoseconds: u64) -> Result<(), AcquisitionMetaError> {
-        let valid = unsafe {
-            spa_sys::spa_meta_acquisition_set_exposure_duration(self.as_raw_mut(), nanoseconds)
-        };
-        valid.then_some(()).ok_or(AcquisitionMetaError)
-    }
-
-    pub fn exposure_duration(&self) -> Result<Option<u64>, AcquisitionMetaError> {
-        let flags = self.flags()?;
-        Ok(flags
-            .contains(AcquisitionFlags::EXPOSURE_DURATION_VALID)
-            .then_some(self.0.exposure_duration_nsec))
-    }
-
-    /// Uses the native helper to compare complete, valid identity tuples.
-    pub fn identity_equal(&self, other: &Self) -> bool {
-        unsafe { spa_sys::spa_meta_acquisition_identity_equal(self.as_raw(), other.as_raw()) }
-    }
-
-    /// Returns `self - other` and the saturated sum of timestamp uncertainties.
-    ///
-    /// The values are available only when both timestamps carry the same valid
-    /// PTP grandmaster identity and PTP domain number.
-    pub fn time_difference(&self, other: &Self) -> Option<(i64, u64)> {
-        let mut difference = 0;
-        let mut uncertainty = 0;
-        let comparable = unsafe {
-            spa_sys::spa_meta_acquisition_time_difference(
-                self.as_raw(),
-                other.as_raw(),
+    /// Difference and saturating uncertainty sum, only for the same qualified PTP authority.
+    pub fn time_difference(self, other: Self) -> Option<(i64, u64)> {
+        let (mut difference, mut uncertainty) = (0, 0);
+        unsafe {
+            spa_sys::spa_exposure_start_time_difference(
+                &self.as_raw(),
+                &other.as_raw(),
                 &mut difference,
                 &mut uncertainty,
             )
-        };
-        comparable.then_some((difference, uncertainty))
-    }
-
-    /// Tests whether comparable PTP timestamps overlap within extra tolerance.
-    pub fn times_match(&self, other: &Self, tolerance_nanoseconds: u64) -> bool {
-        unsafe {
-            spa_sys::spa_meta_acquisition_times_match(
-                self.as_raw(),
-                other.as_raw(),
-                tolerance_nanoseconds,
-            )
         }
+        .then_some((difference, uncertainty))
     }
-
-    /// Validates this allocation with the authoritative native helper.
-    pub fn validate(&self) -> Result<(), AcquisitionMetaError> {
-        let wrapper = spa_sys::spa_meta {
-            type_: spa_sys::SPA_META_Acquisition,
-            size: std::mem::size_of::<spa_sys::spa_meta_acquisition>() as u32,
-            data: std::ptr::addr_of!(self.0).cast_mut().cast(),
-        };
-        let valid = unsafe { spa_sys::spa_meta_acquisition_is_valid(&wrapper) };
-        valid.then_some(()).ok_or(AcquisitionMetaError)
-    }
-}
-
-impl Default for MetaAcquisition {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Debug for MetaAcquisition {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MetaAcquisition")
-            .field("version", &self.version())
-            .field("abi_size", &self.abi_size())
-            .field("flags", &self.flags())
-            .field("identity", &self.identity())
-            .field("exposure_start", &self.exposure_start())
-            .field("exposure_timebase", &self.exposure_timebase())
-            .field("ptp_reference", &self.ptp_reference())
-            .field("exposure_duration", &self.exposure_duration())
-            .finish()
-    }
-}
-
-impl Metadata for MetaAcquisition {
-    const META_TYPE: u32 = spa_sys::SPA_META_Acquisition;
-}
-
-#[cfg(test)]
-mod acquisition_tests {
-    use super::*;
-
-    fn domain(first_byte: u8) -> AcquisitionDomain {
-        let mut bytes = [0; ACQUISITION_DOMAIN_SIZE];
-        bytes[0] = first_byte;
-        AcquisitionDomain::new(bytes).unwrap()
-    }
-
-    fn grandmaster(first_byte: u8) -> PtpClockIdentity {
-        let mut bytes = [0; ACQUISITION_PTP_CLOCK_ID_SIZE];
-        bytes[0] = first_byte;
-        PtpClockIdentity::new(bytes).unwrap()
-    }
-
-    #[test]
-    fn acquisition_metadata_matches_native_version_two_abi() {
-        assert_eq!(ACQUISITION_DOMAIN_SIZE, 16);
-        assert_eq!(ACQUISITION_PTP_CLOCK_ID_SIZE, 8);
-        assert_eq!(
-            std::mem::size_of::<MetaAcquisition>(),
-            spa_sys::SPA_META_ACQUISITION_SIZE as usize
-        );
-        assert_eq!(std::mem::align_of::<MetaAcquisition>(), 8);
-        assert_eq!(
-            std::mem::offset_of!(spa_sys::spa_meta_acquisition, domain),
-            16
-        );
-        assert_eq!(
-            std::mem::offset_of!(spa_sys::spa_meta_acquisition, generation),
-            32
-        );
-        assert_eq!(
-            std::mem::offset_of!(spa_sys::spa_meta_acquisition, sequence),
-            40
-        );
-        assert_eq!(
-            std::mem::offset_of!(spa_sys::spa_meta_acquisition, exposure_start_nsec),
-            48
-        );
-        assert_eq!(
-            std::mem::offset_of!(spa_sys::spa_meta_acquisition, ptp_grandmaster_id),
-            72
-        );
-        assert_eq!(
-            std::mem::offset_of!(spa_sys::spa_meta_acquisition, ptp_domain_number),
-            80
-        );
-        assert_eq!(MetaAcquisition::META_TYPE, spa_sys::SPA_META_Acquisition);
-        assert_eq!(
-            AcquisitionFlags::all().bits(),
-            spa_sys::SPA_META_ACQUISITION_FLAG_ALL
-        );
-    }
-
-    #[test]
-    fn acquisition_metadata_exposes_valid_identity_and_time() {
-        assert_eq!(
-            AcquisitionDomain::new([0; ACQUISITION_DOMAIN_SIZE]),
-            Err(AcquisitionMetaError)
-        );
-
-        let identity = AcquisitionIdentity::new(domain(1), 7, 42);
-        let mut meta = MetaAcquisition::new();
-        meta.validate().unwrap();
-        assert_eq!(meta.flags().unwrap(), AcquisitionFlags::empty());
-        assert_eq!(meta.identity().unwrap(), None);
-        assert_eq!(meta.exposure_start().unwrap(), None);
-        assert_eq!(meta.exposure_duration().unwrap(), None);
-
-        meta.set_identity(identity).unwrap();
-        meta.set_exposure_start(123_456, 9).unwrap();
-        meta.set_exposure_duration(5_000).unwrap();
-        meta.validate().unwrap();
-        assert_eq!(meta.identity().unwrap(), Some(identity));
-        assert_eq!(meta.exposure_start().unwrap(), Some((123_456, 9)));
-        assert_eq!(
-            meta.exposure_timebase().unwrap(),
-            Some(AcquisitionTimebase::Monotonic)
-        );
-        assert_eq!(meta.ptp_reference().unwrap(), None);
-        assert_eq!(meta.exposure_duration().unwrap(), Some(5_000));
-
-        let mut same = MetaAcquisition::new();
-        same.set_identity(identity).unwrap();
-        assert!(meta.identity_equal(&same));
-        same.set_identity(AcquisitionIdentity::new(domain(1), 7, 43))
-            .unwrap();
-        assert!(!meta.identity_equal(&same));
-
-        meta.initialize();
-        assert_eq!(meta.identity().unwrap(), None);
-        assert_eq!(meta.as_raw().exposure_start_nsec, spa_sys::SPA_TIME_INVALID);
-    }
-
-    #[test]
-    fn acquisition_metadata_compares_ptp_times_across_hosts() {
-        assert_eq!(
-            PtpClockIdentity::new([0; ACQUISITION_PTP_CLOCK_ID_SIZE]),
-            Err(AcquisitionMetaError)
-        );
-        let reference = AcquisitionPtpReference::new(grandmaster(1), 7);
-        let mut first = MetaAcquisition::new();
-        let mut second = MetaAcquisition::new();
-        first.set_exposure_start_ptp(123_456, 9, reference).unwrap();
-        second
-            .set_exposure_start_ptp(123_500, 11, reference)
-            .unwrap();
-
-        assert_eq!(
-            first.exposure_timebase().unwrap(),
-            Some(AcquisitionTimebase::Tai)
-        );
-        assert_eq!(first.ptp_reference().unwrap(), Some(reference));
-        assert_eq!(first.time_difference(&second), Some((-44, 20)));
-        assert!(!first.times_match(&second, 23));
-        assert!(first.times_match(&second, 24));
-
-        second
-            .set_exposure_start_ptp(123_500, 11, AcquisitionPtpReference::new(grandmaster(2), 7))
-            .unwrap();
-        assert_eq!(first.time_difference(&second), None);
-    }
-
-    #[test]
-    fn acquisition_metadata_rejects_malformed_values() {
-        let mut meta = MetaAcquisition::new();
-        meta.set_identity(AcquisitionIdentity::new(domain(1), 7, 42))
-            .unwrap();
-        meta.as_raw_mut().flags |= 1 << 31;
-        assert_eq!(meta.validate(), Err(AcquisitionMetaError));
-
-        meta.initialize();
-        meta.as_raw_mut().reserved[0] = 1;
-        assert_eq!(meta.validate(), Err(AcquisitionMetaError));
-
-        meta.initialize();
-        meta.as_raw_mut().exposure_start_nsec = 0;
-        assert_eq!(meta.validate(), Err(AcquisitionMetaError));
-
-        meta.initialize();
-        assert_eq!(
-            meta.set_exposure_start(spa_sys::SPA_TIME_INVALID, 0),
-            Err(AcquisitionMetaError)
-        );
-        assert_eq!(meta.set_exposure_duration(0), Err(AcquisitionMetaError));
-    }
-
-    #[test]
-    fn native_acquisition_values_are_validated_when_wrapped() {
-        let mut meta = MetaAcquisition::new();
-        meta.set_identity(AcquisitionIdentity::new(domain(1), 7, 42))
-            .unwrap();
-
-        let wrapped = MetaAcquisition::from_raw(*meta.as_raw()).unwrap();
-        assert_eq!(wrapped.identity(), meta.identity());
-
-        let mut malformed = *meta.as_raw();
-        malformed.reserved[0] = 1;
-        assert!(MetaAcquisition::from_raw(malformed).is_err());
+    pub fn times_match(self, other: Self, tolerance: u64) -> bool {
+        unsafe {
+            spa_sys::spa_exposure_start_times_match(&self.as_raw(), &other.as_raw(), tolerance)
+        }
     }
 }

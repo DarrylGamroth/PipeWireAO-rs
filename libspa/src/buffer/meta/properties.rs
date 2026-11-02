@@ -84,11 +84,9 @@ impl<'a> BufferProperties<'a> {
         (!value.is_null()).then(|| unsafe { Pod::from_raw(value) })
     }
 
-    /// Electrical trigger classification, using the existing Acquisition trigger enum.
+    /// Electrical trigger classification, independent of optical classification.
     /// Missing key differs from explicit absent or mixed classification.
-    pub fn trigger_classification(
-        &self,
-    ) -> Option<spa_sys::spa_meta_acquisition_trigger_classification> {
+    pub fn trigger_classification(&self) -> Option<spa_sys::spa_meta_trigger_classification> {
         self.get(spa_sys::SPA_META_PROPERTY_triggerClassification)
             .map(|value| {
                 value
@@ -98,20 +96,50 @@ impl<'a> BufferProperties<'a> {
             })
     }
 
-    /// Require equal electrical classifications when Properties and Acquisition v3 both supply one.
-    /// Acquisition v1/v2 may coexist with the new trigger property without supplying a duplicate.
-    pub fn acquisition_is_consistent(&self, acquisition: Option<&super::MetaAcquisition>) -> bool {
-        let raw = acquisition.map(|value| spa_sys::spa_meta {
-            type_: spa_sys::SPA_META_Acquisition,
-            size: std::mem::size_of::<spa_sys::spa_meta_acquisition>() as u32,
-            data: std::ptr::from_ref(value.as_raw()).cast_mut().cast(),
-        });
-        unsafe {
-            spa_sys::spa_meta_properties_acquisition_is_consistent(
-                &self.raw,
-                raw.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
-            )
+    /// Full-width unsigned fact encoded as eight little-endian bytes.
+    pub fn uint64(&self, key: u32) -> Option<u64> {
+        let mut value = 0;
+        unsafe { spa_sys::spa_meta_properties_get_uint64(&self.raw, key, &mut value) }
+            .then_some(value)
+    }
+
+    pub fn acquisition_identity(&self) -> Option<super::AcquisitionIdentity> {
+        let mut raw = std::mem::MaybeUninit::<spa_sys::spa_acquisition_identity>::uninit();
+        if !unsafe {
+            spa_sys::spa_meta_properties_get_acquisition_identity(&self.raw, raw.as_mut_ptr())
+        } {
+            return None;
         }
+        let raw = unsafe { raw.assume_init() };
+        Some(super::AcquisitionIdentity::new(
+            super::AcquisitionDomain::new(raw.domain).expect("validated domain"),
+            raw.generation,
+            raw.sequence,
+        ))
+    }
+
+    pub fn exposure_duration(&self) -> Option<u64> {
+        self.uint64(spa_sys::SPA_META_PROPERTY_exposureDuration)
+    }
+
+    pub fn exposure_start(&self) -> Option<super::ExposureStart> {
+        let mut raw = std::mem::MaybeUninit::<spa_sys::spa_exposure_start>::uninit();
+        if !unsafe { spa_sys::spa_meta_properties_get_exposure_start(&self.raw, raw.as_mut_ptr()) }
+        {
+            return None;
+        }
+        let raw = unsafe { raw.assume_init() };
+        let ptp = (raw.timebase == spa_sys::SPA_EXPOSURE_TIMEBASE_TAI).then(|| {
+            super::AcquisitionPtpReference::new(
+                super::PtpClockIdentity::new(raw.ptp_grandmaster_identity)
+                    .expect("validated grandmaster"),
+                raw.ptp_domain_number,
+            )
+        });
+        Some(
+            super::ExposureStart::new(raw.nsec, raw.uncertainty_nsec, ptp)
+                .expect("validated start"),
+        )
     }
 
     /// Distinguish no optical property from explicit absent or mixed content.
@@ -130,174 +158,283 @@ impl<'a> BufferProperties<'a> {
     }
 }
 
+/// Private mutable builder. Only `finish` exposes a complete validated Object.
+/// Appends must follow ascending key order, including complete semantic groups.
+pub struct BufferPropertiesBuilder<'a> {
+    raw: spa_sys::spa_meta,
+    _storage: PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> BufferPropertiesBuilder<'a> {
+    /// Clear the entire allocation before appending this buffer's facts.
+    pub fn new(storage: &'a mut [u8]) -> Result<Self, BufferPropertiesError> {
+        let mut raw = spa_sys::spa_meta {
+            type_: spa_sys::SPA_META_Properties,
+            size: u32::try_from(storage.len()).map_err(|_| BufferPropertiesError)?,
+            data: storage.as_mut_ptr().cast(),
+        };
+        if !unsafe { spa_sys::spa_meta_properties_init(&mut raw) } {
+            return Err(BufferPropertiesError);
+        }
+        Ok(Self {
+            raw,
+            _storage: PhantomData,
+        })
+    }
+    /// Append a POD body with explicit flags and type. Native validation checks sizes and bounds.
+    pub fn add(
+        &mut self,
+        key: u32,
+        flags: u32,
+        type_: u32,
+        body: &[u8],
+    ) -> Result<(), BufferPropertiesError> {
+        let size = u32::try_from(body.len()).map_err(|_| BufferPropertiesError)?;
+        unsafe {
+            spa_sys::spa_meta_properties_add(
+                &mut self.raw,
+                key,
+                flags,
+                type_,
+                size,
+                body.as_ptr().cast(),
+            )
+        }
+        .then_some(())
+        .ok_or(BufferPropertiesError)
+    }
+    pub fn add_uint64(
+        &mut self,
+        key: u32,
+        flags: u32,
+        value: u64,
+    ) -> Result<(), BufferPropertiesError> {
+        unsafe { spa_sys::spa_meta_properties_add_uint64(&mut self.raw, key, flags, value) }
+            .then_some(())
+            .ok_or(BufferPropertiesError)
+    }
+    pub fn add_acquisition_identity(
+        &mut self,
+        identity: super::AcquisitionIdentity,
+    ) -> Result<(), BufferPropertiesError> {
+        let flags = spa_sys::SPA_POD_PROP_FLAG_MANDATORY;
+        self.add(
+            spa_sys::SPA_META_PROPERTY_acquisitionDomain,
+            flags,
+            spa_sys::SPA_TYPE_Bytes,
+            identity.domain().as_bytes(),
+        )?;
+        self.add_uint64(
+            spa_sys::SPA_META_PROPERTY_acquisitionGeneration,
+            flags,
+            identity.generation(),
+        )?;
+        self.add_uint64(
+            spa_sys::SPA_META_PROPERTY_acquisitionSequence,
+            flags,
+            identity.sequence(),
+        )
+    }
+    pub fn add_exposure_duration(&mut self, duration: u64) -> Result<(), BufferPropertiesError> {
+        self.add_uint64(
+            spa_sys::SPA_META_PROPERTY_exposureDuration,
+            spa_sys::SPA_POD_PROP_FLAG_MANDATORY,
+            duration,
+        )
+    }
+    pub fn add_exposure_start(
+        &mut self,
+        start: super::ExposureStart,
+    ) -> Result<(), BufferPropertiesError> {
+        let flags = spa_sys::SPA_POD_PROP_FLAG_MANDATORY;
+        self.add(
+            spa_sys::SPA_META_PROPERTY_exposureStart,
+            flags,
+            spa_sys::SPA_TYPE_Long,
+            &start.nanoseconds().to_ne_bytes(),
+        )?;
+        let timebase = match start.timebase() {
+            super::AcquisitionTimebase::Monotonic => spa_sys::SPA_EXPOSURE_TIMEBASE_MONOTONIC,
+            super::AcquisitionTimebase::Tai => spa_sys::SPA_EXPOSURE_TIMEBASE_TAI,
+        };
+        self.add(
+            spa_sys::SPA_META_PROPERTY_exposureTimebase,
+            flags,
+            spa_sys::SPA_TYPE_Id,
+            &timebase.to_ne_bytes(),
+        )?;
+        self.add_uint64(
+            spa_sys::SPA_META_PROPERTY_timestampUncertainty,
+            flags,
+            start.uncertainty(),
+        )?;
+        if let Some(ptp) = start.ptp_reference() {
+            self.add(
+                spa_sys::SPA_META_PROPERTY_ptpGrandmasterIdentity,
+                flags,
+                spa_sys::SPA_TYPE_Bytes,
+                ptp.grandmaster().as_bytes(),
+            )?;
+            self.add(
+                spa_sys::SPA_META_PROPERTY_ptpDomainNumber,
+                flags,
+                spa_sys::SPA_TYPE_Id,
+                &u32::from(ptp.domain_number()).to_ne_bytes(),
+            )?;
+        }
+        Ok(())
+    }
+    pub fn finish(
+        self,
+        requirements: &[BufferPropertyRequirement],
+    ) -> Result<BufferProperties<'a>, BufferPropertiesError> {
+        let storage =
+            unsafe { std::slice::from_raw_parts(self.raw.data.cast(), self.raw.size as usize) };
+        BufferProperties::from_bytes(storage, requirements)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn storage(optical: Option<u32>, trigger: Option<u32>) -> [u64; 16] {
-        let mut words = [0u64; 16];
-        let mut raw = spa_sys::spa_meta {
-            type_: spa_sys::SPA_META_Properties,
-            size: std::mem::size_of_val(&words) as u32,
-            data: words.as_mut_ptr().cast(),
-        };
-        assert!(unsafe { spa_sys::spa_meta_properties_init(&mut raw) });
-        if let Some(value) = optical {
-            assert!(unsafe {
-                spa_sys::spa_meta_properties_add(
-                    &mut raw,
-                    spa_sys::SPA_META_PROPERTY_opticalClassification,
-                    spa_sys::SPA_TYPE_Id,
-                    4,
-                    std::ptr::from_ref(&value).cast(),
-                )
-            });
+    use crate::buffer::meta::{
+        AcquisitionDomain, AcquisitionIdentity, AcquisitionPtpReference, ExposureStart,
+        PtpClockIdentity,
+    };
+    fn bytes(words: &mut [u64]) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr().cast(), std::mem::size_of_val(words))
         }
-        if let Some(value) = trigger {
-            assert!(unsafe {
-                spa_sys::spa_meta_properties_add(
-                    &mut raw,
-                    spa_sys::SPA_META_PROPERTY_triggerClassification,
-                    spa_sys::SPA_TYPE_Id,
-                    4,
-                    std::ptr::from_ref(&value).cast(),
-                )
-            });
-        }
-        // An optional unknown typed property must not disable known properties.
-        let value = 17i32;
-        assert!(unsafe {
-            spa_sys::spa_meta_properties_add(
-                &mut raw,
-                123,
-                spa_sys::SPA_TYPE_Int,
-                4,
-                std::ptr::from_ref(&value).cast(),
-            )
-        });
-        words
     }
-    fn bytes(words: &[u64]) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), std::mem::size_of_val(words)) }
-    }
-
     #[test]
-    fn optical_states_and_unknown_optional_properties_are_typed() {
-        assert_eq!(
-            crate::utils::SpaTypes::ObjectBufferProperties.as_raw(),
-            spa_sys::SPA_TYPE_OBJECT_BufferProperties
+    fn full_unsigned_facts_and_ptp_round_trip() {
+        let mut words = [0; 64];
+        let identity = AcquisitionIdentity::new(
+            AcquisitionDomain::new([1; 16]).unwrap(),
+            u64::MAX,
+            u64::MAX - 1,
         );
-        for (raw, expected) in [
-            (0, OpticalClassification::Absent),
-            (1, OpticalClassification::Unfringed),
-            (2, OpticalClassification::Fringed),
-            (3, OpticalClassification::Mixed),
-        ] {
-            let words = storage(Some(raw), None);
-            let properties = BufferProperties::from_bytes(bytes(&words), &[]).unwrap();
-            assert_eq!(properties.optical_classification(), Some(expected));
-            assert_eq!(properties.get(123).unwrap().get_int().unwrap(), 17);
-            assert!(properties.get(124).is_none());
-        }
+        let start = ExposureStart::new(
+            i64::MAX,
+            u64::MAX,
+            Some(AcquisitionPtpReference::new(
+                PtpClockIdentity::new([2; 8]).unwrap(),
+                255,
+            )),
+        )
+        .unwrap();
+        let mut builder = BufferPropertiesBuilder::new(bytes(&mut words)).unwrap();
+        builder.add_acquisition_identity(identity).unwrap();
+        builder.add_exposure_duration(u64::MAX).unwrap();
+        builder.add_exposure_start(start).unwrap();
+        let properties = builder.finish(&[]).unwrap();
+        assert_eq!(properties.acquisition_identity(), Some(identity));
+        assert_eq!(properties.exposure_duration(), Some(u64::MAX));
+        assert_eq!(properties.exposure_start(), Some(start));
+        assert_eq!(start.time_difference(start), Some((0, u64::MAX)));
+        assert!(start.times_match(start, 0));
     }
-
     #[test]
-    fn required_properties_fail_when_missing_or_wrong_type() {
-        let required = [BufferPropertyRequirement::new(
-            spa_sys::SPA_META_PROPERTY_opticalClassification,
-            spa_sys::SPA_TYPE_Id,
-        )];
-        let words = storage(None, None);
-        assert!(BufferProperties::from_bytes(bytes(&words), &required).is_err());
+    fn exposure_comparison_requires_matching_qualified_authority() {
+        let authority = AcquisitionPtpReference::new(PtpClockIdentity::new([1; 8]).unwrap(), 7);
+        let first = ExposureStart::new(100, 2, Some(authority)).unwrap();
+        let second = ExposureStart::new(110, 3, Some(authority)).unwrap();
+        assert_eq!(first.time_difference(second), Some((-10, 5)));
+        assert!(!first.times_match(second, 4));
+        assert!(first.times_match(second, 5));
         assert_eq!(
-            BufferProperties::from_bytes(bytes(&words), &[])
-                .unwrap()
-                .optical_classification(),
+            first.time_difference(ExposureStart::new(100, 0, None).unwrap()),
             None
         );
-        let words = storage(Some(2), None);
-        assert!(BufferProperties::from_bytes(bytes(&words), &required).is_ok());
-        let wrong = [BufferPropertyRequirement::new(
-            spa_sys::SPA_META_PROPERTY_opticalClassification,
-            spa_sys::SPA_TYPE_Int,
+        let other = AcquisitionPtpReference::new(PtpClockIdentity::new([2; 8]).unwrap(), 7);
+        assert_eq!(
+            first.time_difference(ExposureStart::new(100, 0, Some(other)).unwrap()),
+            None
+        );
+        assert!(ExposureStart::new(-1, 0, None).is_err());
+    }
+
+    #[test]
+    fn declared_custom_mandatory_fact_does_not_hide_known_semantic_facts() {
+        let mut words = [0; 64];
+        let mut builder = BufferPropertiesBuilder::new(bytes(&mut words)).unwrap();
+        builder.add_exposure_duration(u64::MAX).unwrap();
+        builder
+            .add(
+                123,
+                spa_sys::SPA_POD_PROP_FLAG_MANDATORY,
+                spa_sys::SPA_TYPE_Int,
+                &17i32.to_ne_bytes(),
+            )
+            .unwrap();
+        assert!(builder.finish(&[]).is_err());
+        let properties = BufferProperties::from_bytes(
+            bytes(&mut words),
+            &[BufferPropertyRequirement::new(123, spa_sys::SPA_TYPE_Int)],
+        )
+        .unwrap();
+        assert_eq!(properties.exposure_duration(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn incomplete_groups_missing_requirements_and_reuse_fail_closed() {
+        let mut words = [0; 64];
+        let mut builder = BufferPropertiesBuilder::new(bytes(&mut words)).unwrap();
+        assert!(builder
+            .add_uint64(spa_sys::SPA_META_PROPERTY_acquisitionGeneration, 0, 1)
+            .is_err());
+        builder
+            .add_uint64(
+                spa_sys::SPA_META_PROPERTY_acquisitionGeneration,
+                spa_sys::SPA_POD_PROP_FLAG_MANDATORY,
+                1,
+            )
+            .unwrap();
+        assert!(builder.finish(&[]).is_err());
+        let required = [BufferPropertyRequirement::new(
+            spa_sys::SPA_META_PROPERTY_acquisitionDomain,
+            spa_sys::SPA_TYPE_Bytes,
         )];
-        assert!(BufferProperties::from_bytes(bytes(&words), &wrong).is_err());
+        assert!(BufferPropertiesBuilder::new(bytes(&mut words))
+            .unwrap()
+            .finish(&required)
+            .is_err());
+        let properties = BufferPropertiesBuilder::new(bytes(&mut words))
+            .unwrap()
+            .finish(&[])
+            .unwrap();
+        assert_eq!(properties.acquisition_identity(), None);
     }
-
     #[test]
-    fn unknown_mandatory_property_needs_explicit_required_type() {
-        let mut words = storage(Some(2), None);
-        words[5] |= (spa_sys::SPA_POD_PROP_FLAG_MANDATORY as u64) << 32;
-        assert!(BufferProperties::from_bytes(bytes(&words), &[]).is_err());
-        let requirements = [BufferPropertyRequirement::new(123, spa_sys::SPA_TYPE_Int)];
-        let properties = BufferProperties::from_bytes(bytes(&words), &requirements).unwrap();
-        assert_eq!(properties.get(123).unwrap().get_int().unwrap(), 17);
-    }
-
-    #[test]
-    fn trigger_properties_migrate_acquisition_v3_without_coupling_optical_content() {
-        for trigger in 0..=3 {
-            let words = storage(Some(spa_sys::SPA_META_OPTICAL_FRINGED), Some(trigger));
-            let properties = BufferProperties::from_bytes(bytes(&words), &[]).unwrap();
-            assert_eq!(properties.trigger_classification(), Some(trigger));
-            assert_eq!(
-                properties.optical_classification(),
-                Some(OpticalClassification::Fringed)
-            );
-            assert!(properties.acquisition_is_consistent(None));
-            let mut acquisition = super::super::MetaAcquisition::new();
-            assert_eq!(acquisition.trigger_classification().unwrap(), None);
-            assert!(properties.acquisition_is_consistent(Some(&acquisition)));
-            for duplicate in 0..=3 {
-                assert!(unsafe {
-                    spa_sys::spa_meta_acquisition_set_trigger_classification(
-                        acquisition.as_raw_mut(),
-                        duplicate,
+    fn optical_and_electrical_are_independent_and_unknown_optional_is_retained() {
+        for optical in 0u32..=3 {
+            for trigger in 0u32..=3 {
+                let mut words = [0; 64];
+                let mut builder = BufferPropertiesBuilder::new(bytes(&mut words)).unwrap();
+                builder
+                    .add(
+                        spa_sys::SPA_META_PROPERTY_opticalClassification,
+                        0,
+                        spa_sys::SPA_TYPE_Id,
+                        &optical.to_ne_bytes(),
                     )
-                });
-                assert_eq!(
-                    acquisition.trigger_classification().unwrap(),
-                    Some(duplicate)
-                );
-                assert_eq!(
-                    properties.acquisition_is_consistent(Some(&acquisition)),
-                    trigger == duplicate
-                );
+                    .unwrap();
+                builder
+                    .add(
+                        spa_sys::SPA_META_PROPERTY_triggerClassification,
+                        0,
+                        spa_sys::SPA_TYPE_Id,
+                        &trigger.to_ne_bytes(),
+                    )
+                    .unwrap();
+                builder
+                    .add(123, 0, spa_sys::SPA_TYPE_Int, &17i32.to_ne_bytes())
+                    .unwrap();
+                let properties = builder.finish(&[]).unwrap();
+                assert_eq!(properties.trigger_classification(), Some(trigger));
+                assert!(properties.optical_classification().is_some());
+                assert_eq!(properties.get(123).unwrap().get_int().unwrap(), 17);
             }
         }
-        let words = storage(None, Some(spa_sys::SPA_META_ACQUISITION_TRIGGER_LOW));
-        let wrong_type = [BufferPropertyRequirement::new(
-            spa_sys::SPA_META_PROPERTY_triggerClassification,
-            spa_sys::SPA_TYPE_Int,
-        )];
-        assert!(BufferProperties::from_bytes(bytes(&words), &wrong_type).is_err());
-        let mut invalid = words;
-        invalid[4] = 4;
-        assert!(BufferProperties::from_bytes(bytes(&invalid), &[]).is_err());
-        let words = storage(None, None);
-        let properties = BufferProperties::from_bytes(bytes(&words), &[]).unwrap();
-        assert_eq!(properties.trigger_classification(), None);
-        let required = [BufferPropertyRequirement::new(
-            spa_sys::SPA_META_PROPERTY_triggerClassification,
-            spa_sys::SPA_TYPE_Id,
-        )];
-        assert!(BufferProperties::from_bytes(bytes(&words), &required).is_err());
-        let mut acquisition = super::super::MetaAcquisition::new();
-        assert!(unsafe {
-            spa_sys::spa_meta_acquisition_set_trigger_classification(
-                acquisition.as_raw_mut(),
-                spa_sys::SPA_META_ACQUISITION_TRIGGER_HIGH,
-            )
-        });
-        assert!(properties.acquisition_is_consistent(Some(&acquisition)));
-    }
-
-    #[test]
-    fn malformed_size_alignment_padding_and_scalar_are_rejected() {
-        let mut words = storage(Some(2), None);
-        assert!(BufferProperties::from_bytes(&bytes(&words)[1..], &[]).is_err());
-        assert!(BufferProperties::from_bytes(&bytes(&words)[..15], &[]).is_err());
-        words[4] = 99; // optical Id body and its padding
-        assert!(BufferProperties::from_bytes(bytes(&words), &[]).is_err());
     }
 }

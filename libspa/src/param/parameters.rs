@@ -3,10 +3,9 @@
 
 //! Owned storage for SPA parameter lists.
 
-use std::{io::Cursor, mem::size_of};
+use std::io::Cursor;
 
 use crate::{
-    buffer::meta::{MetaAcquisition, Metadata},
     pod::{serialize::PodSerializer, Object, Pod, Property, Value},
     utils::Id,
 };
@@ -63,13 +62,16 @@ impl Parameters {
         Err("parameters do not contain SPA_PARAM_Buffers")
     }
 
-    /// Requests the current PipeWireAO acquisition metadata on every buffer.
-    pub fn with_acquisition_meta(self) -> Self {
-        self.with_meta(
-            MetaAcquisition::META_TYPE,
-            size_of::<MetaAcquisition>(),
-            Some(spa_sys::SPA_META_FEATURE_ACQUISITION_CURRENT as i32),
-        )
+    /// Request the version-one BufferProperties allocation on every buffer.
+    pub fn with_buffer_properties(self, capacity: usize) -> Result<Self, &'static str> {
+        if !(16..=4096).contains(&capacity) || capacity % 8 != 0 {
+            return Err("Properties capacity must be 16 through 4096 and eight-byte aligned");
+        }
+        Ok(self.with_meta(
+            spa_sys::SPA_META_Properties,
+            capacity,
+            Some(spa_sys::SPA_META_FEATURE_PROPERTIES_VERSION_1 as i32),
+        ))
     }
 
     /// Removes the first metadata request for `meta_type`.
@@ -126,7 +128,7 @@ fn serialize(value: Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::meta::MetaHeader;
+    use crate::buffer::meta::{MetaHeader, Metadata};
 
     fn object(type_: u32, id: u32, properties: Vec<Property>) -> Value {
         Value::Object(Object {
@@ -180,19 +182,19 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_metadata_request_carries_version_feature() {
-        let parameters = Parameters::new([]).with_acquisition_meta();
+    fn properties_metadata_request_carries_version_feature() {
+        let parameters = Parameters::new([]).with_buffer_properties(512).unwrap();
         let Value::Object(object) = value(&parameters, 0) else {
             panic!("expected object");
         };
         assert!(object.properties.iter().any(|property| {
             property.key == spa_sys::SPA_PARAM_META_type
-                && property.value == Value::Id(Id(MetaAcquisition::META_TYPE))
+                && property.value == Value::Id(Id(spa_sys::SPA_META_Properties))
         }));
         assert!(object.properties.iter().any(|property| {
             property.key == spa_sys::SPA_PARAM_META_features
                 && property.value
-                    == Value::Int(spa_sys::SPA_META_FEATURE_ACQUISITION_CURRENT as i32)
+                    == Value::Int(spa_sys::SPA_META_FEATURE_PROPERTIES_VERSION_1 as i32)
         }));
     }
 }
