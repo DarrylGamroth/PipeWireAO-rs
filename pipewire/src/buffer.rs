@@ -101,6 +101,35 @@ impl<'s> Buffer<'s> {
         slice_of_data
     }
 
+    /// Validates and borrows all independent metadata for this buffer lease.
+    ///
+    /// A view cannot escape the borrow of its lease guard:
+    /// ```compile_fail
+    /// use pipewire::{Buffer, spa::buffer::meta::MetadataRecords};
+    /// fn escape(buffer: &Buffer<'_>) -> MetadataRecords<'static> {
+    ///     buffer.metadata_records(&[]).unwrap()
+    /// }
+    /// ```
+    pub fn metadata_records(
+        &self,
+        requirements: &[spa_sys::spa_meta_requirement],
+    ) -> Result<spa::buffer::meta::MetadataRecords<'_>, spa::buffer::meta::MetadataRecordsError>
+    {
+        let buffer = unsafe { self.buf.as_ref().buffer.as_ref() }
+            .ok_or(spa::buffer::meta::MetadataRecordsError)?;
+        if buffer.n_metas > spa_sys::SPA_META_MAX_RECORDS
+            || (buffer.n_metas != 0 && buffer.metas.is_null())
+        {
+            return Err(spa::buffer::meta::MetadataRecordsError);
+        }
+        let records = if buffer.n_metas == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(buffer.metas, buffer.n_metas as usize) }
+        };
+        unsafe { spa::buffer::meta::MetadataRecords::from_raw(records, requirements) }
+    }
+
     pub fn find_meta<T>(&self) -> Option<&T>
     where
         T: Metadata,

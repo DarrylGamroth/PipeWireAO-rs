@@ -62,16 +62,25 @@ impl Parameters {
         Err("parameters do not contain SPA_PARAM_Buffers")
     }
 
-    /// Request the version-one BufferProperties allocation on every buffer.
-    pub fn with_buffer_properties(self, capacity: usize) -> Result<Self, &'static str> {
-        if !(16..=4096).contains(&capacity) || capacity % 8 != 0 {
-            return Err("Properties capacity must be 16 through 4096 and eight-byte aligned");
+    /// Adds an exact independently negotiated metadata layout before connection.
+    pub fn with_metadata_record(
+        self,
+        meta_type: u32,
+        size: usize,
+        required: bool,
+    ) -> Result<Self, &'static str> {
+        if size > spa_sys::SPA_META_MAX_BYTES as usize
+            || !unsafe {
+                spa_sys::spa_meta_record_layout_validate(
+                    meta_type,
+                    size as u32,
+                    spa_sys::SPA_META_MAX_BYTES,
+                )
+            }
+        {
+            return Err("unsupported metadata layout");
         }
-        Ok(self.with_meta(
-            spa_sys::SPA_META_Properties,
-            capacity,
-            Some(spa_sys::SPA_META_FEATURE_PROPERTIES_VERSION_1 as i32),
-        ))
+        Ok(self.with_meta(meta_type, size, required))
     }
 
     /// Removes the first metadata request for `meta_type`.
@@ -95,7 +104,7 @@ impl Parameters {
         Ok(self)
     }
 
-    fn with_meta(mut self, meta_type: u32, size: usize, features: Option<i32>) -> Self {
+    fn with_meta(mut self, meta_type: u32, size: usize, required: bool) -> Self {
         let mut properties = vec![
             Property::new(spa_sys::SPA_PARAM_META_type, Value::Id(Id(meta_type))),
             Property::new(
@@ -103,12 +112,10 @@ impl Parameters {
                 Value::Int(i32::try_from(size).expect("metadata size exceeds SPA Int")),
             ),
         ];
-        if let Some(features) = features {
-            properties.push(Property::new(
-                spa_sys::SPA_PARAM_META_features,
-                Value::Int(features),
-            ));
-        }
+        properties.push(Property::new(
+            spa_sys::SPA_PARAM_META_required,
+            Value::Bool(required),
+        ));
         self.0.push(serialize(Value::Object(Object {
             type_: spa_sys::SPA_TYPE_OBJECT_ParamMeta,
             id: spa_sys::SPA_PARAM_Meta,
@@ -182,19 +189,29 @@ mod tests {
     }
 
     #[test]
-    fn properties_metadata_request_carries_version_feature() {
-        let parameters = Parameters::new([]).with_buffer_properties(512).unwrap();
+    fn custom_metadata_request_carries_exact_layout_and_requirement() {
+        let parameters = Parameters::new([])
+            .with_metadata_record(spa_sys::SPA_META_AcquisitionIdentity, 40, true)
+            .unwrap();
         let Value::Object(object) = value(&parameters, 0) else {
-            panic!("expected object");
+            panic!("expected object")
         };
-        assert!(object.properties.iter().any(|property| {
-            property.key == spa_sys::SPA_PARAM_META_type
-                && property.value == Value::Id(Id(spa_sys::SPA_META_Properties))
-        }));
-        assert!(object.properties.iter().any(|property| {
-            property.key == spa_sys::SPA_PARAM_META_features
-                && property.value
-                    == Value::Int(spa_sys::SPA_META_FEATURE_PROPERTIES_VERSION_1 as i32)
-        }));
+        assert!(object
+            .properties
+            .iter()
+            .any(|property| property.key == spa_sys::SPA_PARAM_META_required
+                && property.value == Value::Bool(true)));
+        assert!(Parameters::new([])
+            .with_metadata_record(spa_sys::SPA_META_AcquisitionIdentity, 96, true)
+            .is_err());
+        assert!(Parameters::new([])
+            .with_metadata_record(0x10001, 8, false)
+            .is_err());
+        assert!(Parameters::new([])
+            .with_metadata_record(11 << 16, 0, false)
+            .is_err());
+        assert!(Parameters::new([])
+            .with_metadata_record(0x10001, 0, false)
+            .is_ok());
     }
 }

@@ -19,7 +19,7 @@ bindgen = { workspace = true, features = ["runtime"] }
 system-deps.workspace = true
 
 [package.metadata.system-deps]
-libpipewire = { name = "libpipewire-ao-0.3", version = "0.3" }
+libpipewire = { name = "libpipewire-ao-0.3", version = "3.0" }
 
 [lib]
 name = "pipewire_sys"

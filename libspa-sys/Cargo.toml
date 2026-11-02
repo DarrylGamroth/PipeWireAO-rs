@@ -20,7 +20,7 @@ system-deps.workspace = true
 
 [package.metadata.system-deps]
 libspa = { name = "libspa-ao-0.2", version = "0.2" }
-libpipewire = { name = "libpipewire-ao-0.3", version = "0.3" }
+libpipewire = { name = "libpipewire-ao-0.3", version = "3.0" }
 
 [lib]
 name = "libspa_sys"
