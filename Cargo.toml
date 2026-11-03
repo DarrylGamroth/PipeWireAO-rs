@@ -14,16 +14,16 @@ edition = "2021"
 license = "MIT"
 # When bumping MSRV, don't forget to update it also in .gitlab-ci.yml
 rust-version = "1.80"
-version = "0.10.1"
+version = "0.11.0"
 
 [workspace.dependencies]
 pipewire = { package = "pipewire-ao", path = "./pipewire" }
 pipewire-sys = { package = "pipewire-ao-sys", path = "./pipewire-sys" }
 
 # Aliases
-pw_sys = { package = "pipewire-ao-sys", version = "0.10", path = "./pipewire-sys" }
-spa_sys = { package = "libspa-ao-sys", version = "0.10", path = "./libspa-sys" }
-spa = { package = "libspa-ao", version = "0.10", path = "./libspa" }
+pw_sys = { package = "pipewire-ao-sys", version = "0.11", path = "./pipewire-sys" }
+spa_sys = { package = "libspa-ao-sys", version = "0.11", path = "./libspa-sys" }
+spa = { package = "libspa-ao", version = "0.11", path = "./libspa" }
 
 # External
 libc = "0.2"

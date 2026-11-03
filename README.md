@@ -27,9 +27,10 @@ run Cargo through its Meson development environment.
 
 ## Independent buffer metadata
 
-Native PipeWireAO 3.0.0 owns the layouts in `spa/buffer/meta.h`. Cargo's
+Native PipeWireAO 4.x owns the layouts in `spa/buffer/meta.h`. Cargo's
 bindgen build regenerates sys bindings and inline helper wrappers from those
-headers. Retired Acquisition and BufferProperties metadata are unsupported.
+headers. The Rust 0.11 cohort requires native 4.x at build time. Retired
+Acquisition, BufferProperties and AbsoluteTime metadata are unsupported.
 
 `Buffer::metadata_records(requirements)` validates all bounded descriptors and
 returns read-only `MetadataRecords` tied to the buffer lease. Typed accessors
@@ -40,8 +41,9 @@ bytes. `Parameters::with_metadata_record(type, size, required)` declares the col
 port capability without reducing custom IDs to a 32-bit mask.
 
 Header publication counters remain distinct from physical acquisition identity.
-Exposure timing, absolute REALTIME/TAI events, optical chopping and electrical
-trigger state are independent records. Clock labels alone do not establish
+ExposureTiming and ReferenceTimestamp use 24-byte native layouts; reference
+timestamps preserve unsigned 64-bit nanoseconds. Optical chopping and electrical
+trigger state remain independent. Clock labels alone do not establish
 synchronization. No PTP provider is required.
 
 Focused software verification uses `cargo test -p libspa-ao --lib` with the native

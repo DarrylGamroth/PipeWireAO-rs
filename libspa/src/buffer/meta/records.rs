@@ -112,7 +112,11 @@ typed_record!(
     spa_meta_exposure_timing,
     SPA_META_ExposureTiming
 );
-typed_record!(absolute_time, spa_meta_absolute_time, SPA_META_AbsoluteTime);
+typed_record!(
+    reference_timestamp,
+    spa_meta_reference_timestamp,
+    SPA_META_ReferenceTimestamp
+);
 typed_record!(
     optical_chopping,
     spa_meta_optical_chopping,
@@ -165,11 +169,11 @@ mod tests {
         );
         assert_eq!(
             std::mem::offset_of!(spa_sys::spa_meta_exposure_timing, start_nsec),
-            40
+            8
         );
         assert_eq!(
-            std::mem::offset_of!(spa_sys::spa_meta_absolute_time_event, uncertainty_nsec),
-            72
+            std::mem::offset_of!(spa_sys::spa_meta_reference_timestamp, timestamp_nsec),
+            8
         );
         assert_eq!(records.acquisition_identity().unwrap().generation, u64::MAX);
         assert_eq!(
@@ -181,12 +185,55 @@ mod tests {
             opaque[0].to_ne_bytes()
         );
         assert_eq!(records.find(0x3fe).unwrap().validity(), None);
-        assert_eq!(std::mem::size_of::<spa_sys::spa_meta_exposure_timing>(), 64);
+        assert_eq!(std::mem::size_of::<spa_sys::spa_meta_exposure_timing>(), 24);
         assert_eq!(
-            std::mem::size_of::<spa_sys::spa_meta_absolute_time_event>(),
-            80
+            std::mem::size_of::<spa_sys::spa_meta_reference_timestamp>(),
+            24
         );
-        assert_eq!(std::mem::size_of::<spa_sys::spa_meta_absolute_time>(), 336);
+    }
+
+    #[test]
+    fn reference_timestamp_keeps_unsigned_nanoseconds_and_rejects_invalid_required_facts() {
+        let mut timestamp = spa_sys::spa_meta_reference_timestamp {
+            clock: spa_sys::SPA_META_CLOCK_TAI,
+            reserved: 0,
+            timestamp_nsec: u64::MAX - 1,
+            duration_nsec: u64::MAX,
+        };
+        let raw = spa_sys::spa_meta {
+            type_: spa_sys::SPA_META_ReferenceTimestamp,
+            size: 24,
+            data: std::ptr::from_mut(&mut timestamp).cast(),
+        };
+        let requirement = spa_sys::spa_meta_requirement {
+            type_: raw.type_,
+            size: raw.size,
+            flags: spa_sys::SPA_META_REQUIREMENT_REQUIRED,
+            reserved: 0,
+        };
+        let raws = [raw];
+        let records = unsafe { MetadataRecords::from_raw(&raws, &[requirement]) }.unwrap();
+        assert_eq!(
+            records.reference_timestamp().unwrap().timestamp_nsec,
+            u64::MAX - 1
+        );
+        assert_eq!(
+            records.reference_timestamp().unwrap().duration_nsec,
+            u64::MAX
+        );
+        assert_eq!(
+            &records.find(raw.type_).unwrap().bytes().unwrap()[8..16],
+            &(u64::MAX - 1).to_ne_bytes()
+        );
+        assert!(unsafe { MetadataRecords::from_raw(&[], &[requirement]) }.is_err());
+        timestamp.timestamp_nsec = u64::MAX;
+        assert!(unsafe { MetadataRecords::from_raw(&raws, &[requirement]) }.is_err());
+        timestamp = unsafe { std::mem::zeroed() };
+        let records = unsafe { MetadataRecords::from_raw(&raws, &[]) }.unwrap();
+        assert!(records.reference_timestamp().is_none());
+        assert!(unsafe { MetadataRecords::from_raw(&raws, &[requirement]) }.is_err());
+        // Keep the payload observably live through the raw descriptor mutations.
+        assert_eq!(timestamp.clock, 0);
     }
 
     #[test]
